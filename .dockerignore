@@ -1,0 +1,32 @@
+# Runtime / local data
+captures/
+uploads/
+live_preview/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+system_status.json
+
+# Nested duplicate tree
+AI_Tracker/
+
+# Python / VCS
+__pycache__/
+*.py[cod]
+*.egg-info/
+.git/
+.gitignore
+.venv/
+venv/
+
+# IDE / OS
+.cursor/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Large optional artifacts (downloaded during build)
+retinaface.onnx
