@@ -9,35 +9,24 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <script src="https://cdn.tailwindcss.com"></script>
+  {# Local Tailwind browser build — cdn.tailwindcss.com is often unreachable on this host #}
+  <script src="{{ url_for('static', filename='js/tailwindcss-browser.js') }}?v={{ dashboard_version }}"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script>
-    tailwind.config = {
-      theme: {
-        extend: {
-          fontFamily: {
-            sans: ['"Chakra Petch"', 'system-ui', 'sans-serif'],
-            mono: ['"JetBrains Mono"', 'monospace'],
-          },
-          colors: {
-            cyber: {
-              bg: '#020510',
-              panel: '#040918',
-              border: '#1a2744',
-              cyan: '#00e5ff',
-              green: '#00ff9f',
-              warn: '#fbbf24',
-              muted: '#6b7fa8',
-            },
-          },
-          boxShadow: {
-            glow: '0 0 24px rgba(0, 229, 255, 0.15)',
-            panel: '0 8px 32px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(0, 229, 255, 0.06)',
-          },
-        },
-      },
-    };
-  </script>
+  <style type="text/tailwindcss">
+    @theme {
+      --font-sans: "Chakra Petch", system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", monospace;
+      --color-cyber-bg: #020510;
+      --color-cyber-panel: #040918;
+      --color-cyber-border: #1a2744;
+      --color-cyber-cyan: #00e5ff;
+      --color-cyber-green: #00ff9f;
+      --color-cyber-warn: #fbbf24;
+      --color-cyber-muted: #6b7fa8;
+      --shadow-glow: 0 0 24px rgba(0, 229, 255, 0.15);
+      --shadow-panel: 0 8px 32px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(0, 229, 255, 0.06);
+    }
+  </style>
   <style>
     :root {
       --cyber-bg: #020510;
