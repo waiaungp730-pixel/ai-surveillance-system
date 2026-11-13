@@ -48,6 +48,21 @@ TELEGRAM_ALERT_COOLDOWN_SEC = float(
 )
 # collage = scene + face panel (default); scene = full frame only; both = 2 photos
 TELEGRAM_ALERT_STYLE = os.environ.get("TELEGRAM_ALERT_STYLE", "collage").strip().lower()
+
+
+def _env_bool_alert(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None and name == "TELEGRAM_ALERT_NON_WATCHLIST":
+        raw = os.environ.get("TELEGRAM_ALERT_STRANGERS")
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Strangers-only by default — set TELEGRAM_ALERT_NAMED=1 or WATCHLIST=1 to re-enable.
+TELEGRAM_ALERT_NON_WATCHLIST = _env_bool_alert("TELEGRAM_ALERT_NON_WATCHLIST", True)
+TELEGRAM_ALERT_WATCHLIST = _env_bool_alert("TELEGRAM_ALERT_WATCHLIST", False)
+TELEGRAM_ALERT_NAMED = _env_bool_alert("TELEGRAM_ALERT_NAMED", False)
 TELEGRAM_SCENE_MAX_SIDE = int(os.environ.get("TELEGRAM_SCENE_MAX_SIDE", "1920"))
 TELEGRAM_SCENE_JPEG_QUALITY = int(os.environ.get("TELEGRAM_SCENE_JPEG_QUALITY", "92"))
 # Sharpen Telegram right panel only; saved captures / scene JPEG stay original.
@@ -98,10 +113,78 @@ try:
 except (TypeError, ValueError):
     TELEGRAM_COLLAGE_HEIGHT = 720
 TELEGRAM_COLLAGE_HEIGHT = max(320, min(TELEGRAM_COLLAGE_HEIGHT, 1200))
+# Collage right panel must be a usable person plate (big upper-body), not a
+# tiny forehead/face square letterboxed in black.
+try:
+    TELEGRAM_PANEL_MIN_HEIGHT = int(os.environ.get("TELEGRAM_PANEL_MIN_HEIGHT", "100"))
+except (TypeError, ValueError):
+    TELEGRAM_PANEL_MIN_HEIGHT = 100
+TELEGRAM_PANEL_MIN_HEIGHT = max(72, min(TELEGRAM_PANEL_MIN_HEIGHT, 480))
+try:
+    TELEGRAM_PANEL_MIN_FILL = float(os.environ.get("TELEGRAM_PANEL_MIN_FILL", "0.28"))
+except (TypeError, ValueError):
+    TELEGRAM_PANEL_MIN_FILL = 0.28
+TELEGRAM_PANEL_MIN_FILL = max(0.20, min(TELEGRAM_PANEL_MIN_FILL, 0.90))
 
 _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="telegram-alert")
 _cooldown_lock = threading.Lock()
 _last_sent: Dict[Tuple[str, int], float] = {}
+
+
+def _telegram_panel_worth_sending(panel_bgr: Optional[np.ndarray]) -> Tuple[bool, str]:
+    """
+    True for person panels worth putting on the collage right side.
+
+    Distant hallway faces (~56–90px) are allowed when they already clear the
+    human/face gates — previously these were dropped as ``tiny_letterbox`` /
+    ``small_square`` and no Telegram was sent at all.
+    """
+    if panel_bgr is None or getattr(panel_bgr, "size", 0) == 0:
+        return False, "empty"
+    try:
+        arr = np.ascontiguousarray(panel_bgr)
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        if min(h, w) < 48:
+            return False, f"too_tiny({w}x{h})"
+        try:
+            from face_print_filter import (
+                is_likely_looking_down,
+                is_likely_rear_view,
+                is_likely_unusable_face_plate,
+                capture_crop_passes_human_gate,
+            )
+
+            human_ok, human_why = capture_crop_passes_human_gate(arr)
+            if not human_ok:
+                return False, human_why or "non_human"
+            rear, rear_why = is_likely_rear_view(arr)
+            if rear and not CATCH_BACKS:
+                return False, rear_why or "rear_view"
+            looking, look_why = is_likely_looking_down(arr)
+            if looking and h / float(max(1, w)) < 1.25:
+                # Looking-down is OK on a tall bust plate; reject tight crown squares.
+                return False, look_why or "looking_down"
+            mush, mush_why = is_likely_unusable_face_plate(arr)
+            if mush:
+                return False, mush_why or "unusable"
+        except Exception:
+            pass
+        portrait = h / float(max(1, w)) >= 1.18
+        # Native letterbox: after max upscale, panel must still fill ~half collage.
+        up = max(1.0, float(TELEGRAM_MAX_FACE_UPSCALE))
+        fill_h = float(h) * up / float(max(1, TELEGRAM_COLLAGE_HEIGHT))
+        if portrait and h >= int(TELEGRAM_PANEL_MIN_HEIGHT * 0.85):
+            return True, "portrait"
+        # Compact but real face plates (common on hallway cams) — still alert.
+        if min(h, w) >= 56 and fill_h >= min(0.22, float(TELEGRAM_PANEL_MIN_FILL)):
+            return True, f"compact({w}x{h},fill={fill_h:.2f})"
+        if fill_h < float(TELEGRAM_PANEL_MIN_FILL) and h < TELEGRAM_PANEL_MIN_HEIGHT:
+            return False, f"tiny_letterbox({w}x{h},fill={fill_h:.2f})"
+        if (not portrait) and min(h, w) < 56:
+            return False, f"small_square({w}x{h})"
+        return True, "ok"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def telegram_configured() -> bool:
@@ -371,7 +454,7 @@ def _telegram_person_panel(
                 display_image_is_portrait_body,
             )
 
-            # Prefer YOLO person box (full body plate) when available.
+            # Prefer YOLO person box (full body / bust plate) when available.
             if person_bbox is not None and len(person_bbox) >= 4:
                 fh, fw = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
                 x1, y1, x2, y2 = (float(v) for v in list(person_bbox)[:4])
@@ -383,11 +466,21 @@ def _telegram_person_panel(
                 yy2 = min(fh, int(y2 + pad * bh))
                 if xx2 - xx1 >= 24 and yy2 - yy1 >= 24:
                     person_plate = np.ascontiguousarray(frame_bgr[yy1:yy2, xx1:xx2])
-                    if crop is None or (
-                        int(person_plate.shape[0]) * int(person_plate.shape[1])
-                        >= int(crop.shape[0]) * int(crop.shape[1]) * 2
-                    ):
-                        crop = person_plate
+                    try:
+                        from face_print_filter import capture_crop_passes_human_gate
+
+                        plate_ok, _ = capture_crop_passes_human_gate(person_plate)
+                        if not plate_ok:
+                            person_plate = None
+                    except Exception:
+                        pass
+                    if person_plate is not None:
+                        # Always prefer a larger person plate over a tight face square.
+                        if crop is None or (
+                            int(person_plate.shape[0]) * int(person_plate.shape[1])
+                            >= int(crop.shape[0]) * int(crop.shape[1])
+                        ):
+                            crop = person_plate
 
             if bbox is not None and len(bbox) >= 4:
                 bigger = crop_upper_body_from_frame(
@@ -400,19 +493,16 @@ def _telegram_person_panel(
                     top_pad_ratio=max(0.45, CAPTURE_UPPER_BODY_TOP_PAD_RATIO),
                 )
                 if bigger is not None and getattr(bigger, "size", 0) > 0:
-                    if display_image_is_portrait_body(bigger):
-                        # Prefer bust if it has more pixels than a tiny face square.
-                        if crop is None or (
-                            int(bigger.shape[0]) * int(bigger.shape[1])
-                            >= int(crop.shape[0]) * int(crop.shape[1])
-                        ):
-                            crop = bigger
-                    else:
-                        bh, bw = int(bigger.shape[0]), int(bigger.shape[1])
-                        if crop is None or (bh * bw) >= int(crop.shape[0]) * int(
-                            crop.shape[1]
-                        ):
-                            crop = bigger
+                    # Prefer bust/upper-body whenever it is larger than the face plate.
+                    if crop is None or (
+                        int(bigger.shape[0]) * int(bigger.shape[1])
+                        >= int(crop.shape[0]) * int(crop.shape[1])
+                    ):
+                        crop = bigger
+                    elif display_image_is_portrait_body(bigger) and not display_image_is_portrait_body(
+                        crop
+                    ):
+                        crop = bigger
         except Exception:
             pass
     if crop is not None and getattr(crop, "size", 0) > 0:
@@ -495,6 +585,39 @@ def _letterbox_face_panel(
     return canvas
 
 
+def _panels_look_identical(
+    panel_a: Optional[np.ndarray],
+    panel_b: Optional[np.ndarray],
+    *,
+    thresh: float = 6.0,
+) -> bool:
+    """True when two BGR panels are the same crop (duplicate multi-catch slots)."""
+    if panel_a is None or panel_b is None:
+        return False
+    try:
+        a = np.asarray(panel_a)
+        b = np.asarray(panel_b)
+        if a.size == 0 or b.size == 0:
+            return False
+        sa = cv2.resize(a, (48, 48), interpolation=cv2.INTER_AREA)
+        sb = cv2.resize(b, (48, 48), interpolation=cv2.INTER_AREA)
+        return float(np.mean(cv2.absdiff(sa, sb))) < float(thresh)
+    except Exception:
+        return False
+
+
+def _dedupe_face_panels(panels: Sequence[np.ndarray]) -> List[np.ndarray]:
+    unique: List[np.ndarray] = []
+    for panel in panels:
+        if panel is None or getattr(panel, "size", 0) == 0:
+            continue
+        arr = np.ascontiguousarray(panel)
+        if any(_panels_look_identical(arr, kept) for kept in unique):
+            continue
+        unique.append(arr)
+    return unique
+
+
 def compose_alert_collage_multi(
     scene_bgr: np.ndarray,
     faces_bgr: Sequence[np.ndarray],
@@ -534,15 +657,50 @@ def compose_alert_collage_multi(
         for face in faces_bgr
         if face is not None and getattr(face, "size", 0) > 0
     ]
+    panels = _dedupe_face_panels(panels)
     if not panels:
         return scene_r
 
+    if len(panels) == 1:
+        parts = [scene_r]
+        if gap > 0:
+            parts.append(np.zeros((th, int(gap), 3), dtype=np.uint8))
+        parts.append(panels[0])
+        return np.hstack(parts)
+
+    # Two or more people: stack large portrait panels in one right column.
+    n = len(panels)
+    col_w = max(int(p.shape[1]) for p in panels)
+    col_w = max(col_w, int(round(th * 0.78)), 360)
+    row_h = max(1, th // n)
+    stacked_rows: list[np.ndarray] = []
+    vgap = max(0, int(gap))
+    for idx, panel in enumerate(panels):
+        ph, pw = int(panel.shape[0]), int(panel.shape[1])
+        scale = min(col_w / float(max(1, pw)), row_h / float(max(1, ph)))
+        nw = max(1, int(round(pw * scale)))
+        nh = max(1, int(round(ph * scale)))
+        interp = cv2.INTER_AREA if scale < 0.95 else cv2.INTER_LINEAR
+        resized = cv2.resize(panel, (nw, nh), interpolation=interp)
+        row = np.zeros((row_h, col_w, 3), dtype=np.uint8)
+        x0 = max(0, (col_w - nw) // 2)
+        y0 = max(0, (row_h - nh) // 2)
+        row[y0:y0 + nh, x0:x0 + nw] = resized[:nh, :nw]
+        stacked_rows.append(row)
+        if vgap > 0 and idx < n - 1:
+            stacked_rows.append(np.zeros((vgap, col_w, 3), dtype=np.uint8))
+    person_col = np.vstack(stacked_rows)
+    if person_col.shape[0] != th:
+        person_col = cv2.resize(
+            person_col,
+            (col_w, th),
+            interpolation=cv2.INTER_AREA,
+        )
     strip = np.zeros((th, int(max(0, gap)), 3), dtype=np.uint8) if gap > 0 else None
     parts = [scene_r]
-    for panel in panels:
-        if strip is not None:
-            parts.append(strip)
-        parts.append(panel)
+    if strip is not None:
+        parts.append(strip)
+    parts.append(person_col)
     return np.hstack(parts)
 
 
@@ -834,6 +992,32 @@ def _text_or(value: object, fallback: str) -> str:
     return text or fallback
 
 
+def _alert_kind_allowed(alert_kind: str) -> bool:
+    """Whether this alert type is enabled via dashboard settings / env flags."""
+    kind = (alert_kind or "watchlist").strip().lower()
+    try:
+        from announcement_settings import (
+            telegram_alert_named_enabled,
+            telegram_alert_strangers_enabled,
+            telegram_alert_watchlist_enabled,
+        )
+
+        if kind in ("incident", "stranger"):
+            return telegram_alert_strangers_enabled()
+        if kind == "named":
+            return telegram_alert_named_enabled()
+        # Blacklist shares the Watchlist Telegram toggle (same chat / gate).
+        if kind in ("watchlist", "blacklist", "poi"):
+            return telegram_alert_watchlist_enabled()
+        return telegram_alert_watchlist_enabled()
+    except Exception:
+        if kind in ("incident", "stranger"):
+            return TELEGRAM_ALERT_NON_WATCHLIST
+        if kind == "named":
+            return TELEGRAM_ALERT_NAMED
+        return TELEGRAM_ALERT_WATCHLIST
+
+
 def _queue_target_alert(
     face_bgr: np.ndarray,
     person_id: int,
@@ -852,6 +1036,26 @@ def _queue_target_alert(
     image_quality: Optional[str] = None,
 ) -> bool:
     if person_id is None:
+        return False
+    try:
+        from announcement_settings import announcements_allowed_now
+
+        if not announcements_allowed_now():
+            log.info(
+                "Telegram skip — outside announcement window (person #%s @ %s)",
+                person_id,
+                camera_zone,
+            )
+            return False
+    except Exception:
+        pass
+    if not _alert_kind_allowed(alert_kind):
+        log.info(
+            "Telegram skip — %s alerts disabled (person #%s @ %s)",
+            alert_kind,
+            person_id,
+            camera_zone,
+        )
         return False
     try:
         from face_print_filter import (
@@ -886,9 +1090,29 @@ def _queue_target_alert(
         except Exception:
             pass
         try:
+            from face_print_filter import is_likely_looking_down
+
+            looking, look_why = is_likely_looking_down(face_bgr)
+            if looking:
+                try:
+                    fh, fw = int(face_bgr.shape[0]), int(face_bgr.shape[1])
+                    tall = fh / float(max(1, fw)) >= 1.25 and min(fh, fw) >= 120
+                except Exception:
+                    tall = False
+                if not tall:
+                    print(f"[Telegram] skip looking-down @ {camera_zone} ({look_why})")
+                    log.info(
+                        "Telegram skip — looking-down @ %s (%s)",
+                        camera_zone,
+                        look_why,
+                    )
+                    return False
+        except Exception:
+            pass
+        try:
             h, w = int(face_bgr.shape[0]), int(face_bgr.shape[1])
-            min_side = int(os.environ.get("TELEGRAM_FACE_MIN_SIDE", "56"))
-            if min(h, w) < max(48, min_side):
+            min_side = int(os.environ.get("TELEGRAM_FACE_MIN_SIDE", "40"))
+            if min(h, w) < max(40, min_side):
                 print(
                     f"[Telegram] skip tiny @ {camera_zone} ({w}x{h} < {min_side}px)"
                 )
@@ -1031,27 +1255,27 @@ def _queue_target_alert(
                         bbox=bbox_copy,
                         person_bbox=person_bbox_copy,
                     )
-                    # Upper-body re-cuts often include hallway floor/shirt and trip the
-                    # walking-away heuristic even when the face plate is valid. Fall
-                    # back to the face crop instead of dropping the whole alert.
+                    # Prefer the big upper-body plate. If it looks like a back /
+                    # junk, try the face crop only when that crop is also a large
+                    # usable panel — never fall back to a tiny forehead postage stamp.
                     rear_panel, rear_why = is_likely_rear_view(panel)
                     bad_panel, bad_why = is_likely_non_face_object(panel)
                     if rear_panel or bad_panel:
                         why = rear_why or bad_why
+                        face_ok, face_ok_why = _telegram_panel_worth_sending(face_copy)
                         if rear_panel and not CATCH_BACKS:
-                            log.info(
-                                "Telegram collage back panel @ %s (%s) — using face plate",
-                                cam_key,
-                                why,
-                            )
-                            panel = face_copy
-                            # Face plate may also be a back — drop the alert.
-                            rear_face, rear_face_why = is_likely_rear_view(panel)
-                            if rear_face:
+                            if face_ok:
+                                log.info(
+                                    "Telegram collage back panel @ %s (%s) — using large face plate",
+                                    cam_key,
+                                    why,
+                                )
+                                panel = face_copy
+                            else:
                                 _release_cooldown(cam_key, int(person_id))
                                 print(
-                                    f"[Telegram] skip back-of-head @ {cam_key} "
-                                    f"({rear_face_why})"
+                                    f"[Telegram] skip small/back panel @ {cam_key} "
+                                    f"({why}; face={face_ok_why})"
                                 )
                                 return
                         else:
@@ -1068,13 +1292,20 @@ def _queue_target_alert(
                                     cam_key,
                                     why,
                                 )
-                            else:
+                            elif face_ok:
                                 log.info(
-                                    "Telegram collage panel bad @ %s (%s) — using face plate",
+                                    "Telegram collage panel bad @ %s (%s) — using large face plate",
                                     cam_key,
                                     why,
                                 )
                                 panel = face_copy
+                            else:
+                                _release_cooldown(cam_key, int(person_id))
+                                print(
+                                    f"[Telegram] skip bad/small panel @ {cam_key} "
+                                    f"({why}; face={face_ok_why})"
+                                )
+                                return
                     # Never send a banister/wood/rail plate as the person panel.
                     bad_face, face_why = is_likely_non_face_object(panel)
                     if bad_face and is_junk_person_plate_reason(face_why):
@@ -1083,15 +1314,36 @@ def _queue_target_alert(
                             f"[Telegram] skip non-face panel @ {cam_key} ({face_why})"
                         )
                         return
-                    collage = compose_alert_collage(
-                        scene_copy,
-                        panel,
-                        enhance_face=_telegram_enhance_display(),
-                    )
-                    encoded = _jpeg_bytes(
-                        encode_bgr_jpeg(collage, quality=90, max_side=1600)
-                    )
-                    face_jpeg = encoded or scene_jpeg or natural
+                    panel_ok, panel_why = _telegram_panel_worth_sending(panel)
+                    if not panel_ok:
+                        # Don't drop the alert — send the full CCTV scene instead.
+                        if scene_jpeg is not None:
+                            print(
+                                f"[Telegram] weak collage panel @ {cam_key} "
+                                f"({panel_why}) — sending scene"
+                            )
+                            log.info(
+                                "Telegram weak panel @ %s (%s) — scene fallback",
+                                cam_key,
+                                panel_why,
+                            )
+                            face_jpeg = scene_jpeg
+                        else:
+                            _release_cooldown(cam_key, int(person_id))
+                            print(
+                                f"[Telegram] skip tiny collage panel @ {cam_key} ({panel_why})"
+                            )
+                            return
+                    else:
+                        collage = compose_alert_collage(
+                            scene_copy,
+                            panel,
+                            enhance_face=_telegram_enhance_display(),
+                        )
+                        encoded = _jpeg_bytes(
+                            encode_bgr_jpeg(collage, quality=90, max_side=1600)
+                        )
+                        face_jpeg = encoded or scene_jpeg or natural
                 except Exception as exc:
                     log.debug("Collage build failed: %s", exc)
                     face_jpeg = scene_jpeg or natural
@@ -1156,6 +1408,17 @@ def maybe_send_multi_face_alert_async(
     """
     if not faces:
         return False
+    try:
+        from announcement_settings import announcements_allowed_now
+
+        if not announcements_allowed_now():
+            log.info(
+                "Telegram skip — outside announcement window (multi-catch @ %s)",
+                camera_zone,
+            )
+            return False
+    except Exception:
+        pass
     if not telegram_configured():
         log.warning(
             "Telegram skip — TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set in this process"
@@ -1231,15 +1494,45 @@ def maybe_send_multi_face_alert_async(
 
     eligible = kept
     scene = None if frame_bgr is None else np.ascontiguousarray(frame_bgr)
-    face_panels = [
-        _telegram_person_panel(
+    face_panels = []
+    seen_person_ids: set[int] = set()
+    for item in eligible:
+        try:
+            pid = int(item.get("person_id"))
+        except (TypeError, ValueError):
+            pid = None
+        if pid is not None and pid in seen_person_ids:
+            continue
+        panel = _telegram_person_panel(
             np.ascontiguousarray(item["face_bgr"]),
             frame_bgr=scene,
             bbox=item.get("bbox"),
             person_bbox=item.get("person_bbox"),
         )
-        for item in eligible
-    ]
+        ok, why = _telegram_panel_worth_sending(panel)
+        if not ok:
+            # Prefer a large face crop over dropping the whole multi-catch.
+            face_ok, _ = _telegram_panel_worth_sending(
+                np.ascontiguousarray(item["face_bgr"])
+            )
+            if face_ok:
+                panel = np.ascontiguousarray(item["face_bgr"])
+            else:
+                log.info(
+                    "Telegram multi-catch skip panel person #%s (%s)",
+                    item.get("person_id"),
+                    why,
+                )
+                continue
+        if any(_panels_look_identical(panel, kept) for kept in face_panels):
+            continue
+        face_panels.append(panel)
+        if pid is not None:
+            seen_person_ids.add(pid)
+    if not face_panels:
+        for key_cam, pid in reserved:
+            _release_cooldown(key_cam, pid)
+        return False
     caption_bits: list[str] = []
     for item in eligible:
         name = html.escape(str(item.get("person_name") or f"Person #{item.get('person_id')}"))
@@ -1280,7 +1573,7 @@ def maybe_send_multi_face_alert_async(
             n = len(eligible)
             caption = (
                 f"<b>LIVE AI INFRACTION</b>\n"
-                f"Face detected ×{n}\n"
+                f"Face detected — {n} people\n"
                 f"<b>Camera:</b> {html.escape(cam_label)}\n"
                 f"<b>Location:</b> {html.escape(loc_label)}\n"
                 f"{' · '.join(caption_bits)}\n"

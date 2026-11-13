@@ -634,16 +634,24 @@ def apply_identity_tiers(
             display_face = aligned_face
 
     is_enrolled_watchlist = False
+    is_enrolled_blacklist = False
     if matched_id is not None:
         try:
-            from identity import is_enrolled_watchlist_person
+            from identity import (
+                is_enrolled_blacklist_person,
+                is_enrolled_watchlist_person,
+            )
 
             is_enrolled_watchlist = is_enrolled_watchlist_person(conn, int(matched_id))
+            is_enrolled_blacklist = is_enrolled_blacklist_person(conn, int(matched_id))
         except Exception:
             is_enrolled_watchlist = False
+            is_enrolled_blacklist = False
 
-    # Do not treat auto Stranger_* gallery hits as blacklist alarms in the log.
-    if decision.tier != MatchTier.BLACKLIST_ALERT or is_enrolled_watchlist:
+    is_enrolled_alert = is_enrolled_watchlist or is_enrolled_blacklist
+
+    # Do not treat auto Stranger_* gallery hits as list alarms in the log.
+    if decision.tier != MatchTier.BLACKLIST_ALERT or is_enrolled_alert:
         IdentityTierRouter.log_decision(decision, camera_location)
 
     if decision.tier == MatchTier.BLACKLIST_ALERT and matched_id is not None:
@@ -656,7 +664,7 @@ def apply_identity_tiers(
             except Exception:
                 display_name = None
         cam_label = camera_name or f"CAM-{camera_location}"
-        if not is_enrolled_watchlist:
+        if not is_enrolled_alert:
             try:
                 name_l = str(display_name or "").strip().lower()
                 is_enrolled_watchlist = bool(name_l) and not (
@@ -664,9 +672,10 @@ def apply_identity_tiers(
                     or name_l.startswith("passerby_")
                     or name_l.startswith("unknown")
                 )
+                is_enrolled_alert = is_enrolled_watchlist
             except Exception:
                 pass
-        if send_alert_fn is not None and display_face is not None and is_enrolled_watchlist:
+        if send_alert_fn is not None and display_face is not None and is_enrolled_alert:
             try:
                 send_alert_fn(
                     display_face,
@@ -687,8 +696,8 @@ def apply_identity_tiers(
                     camera_location,
                     decision.match_percent,
                 )
-        # Instant dashboard WebSocket alert (Person of Interest / watchlist).
-        if is_enrolled_watchlist:
+        # Instant dashboard WebSocket alert (Watchlist or Blacklist enroll).
+        if is_enrolled_alert:
             try:
                 from live_detection_hub import publish_person_alert
 
@@ -700,7 +709,7 @@ def apply_identity_tiers(
                     person_id=int(matched_id),
                     known_person_id=int(matched_id),
                     bbox=bbox,
-                    alert_type="blacklist",
+                    alert_type="blacklist" if is_enrolled_blacklist else "watchlist",
                     force=True,
                 )
             except Exception:
@@ -710,14 +719,16 @@ def apply_identity_tiers(
         capture_path: Optional[str] = None
         if display_face is not None:
             try:
+                from announcement_settings import captures_allowed_now
                 from captures import save_face_capture
 
-                capture_path = save_face_capture(
-                    display_face,
-                    matched_id,
-                    abs(hash((camera_location, time.time()))) % 900_000 + 100_000,
-                    person_name=person_name,
-                )
+                if captures_allowed_now():
+                    capture_path = save_face_capture(
+                        display_face,
+                        matched_id,
+                        abs(hash((camera_location, time.time()))) % 900_000 + 100_000,
+                        person_name=person_name,
+                    )
             except Exception:
                 capture_path = None
         log_gray_zone_event(

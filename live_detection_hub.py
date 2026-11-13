@@ -132,8 +132,10 @@ def classify_person_alert(
     name: Optional[str] = None,
 ) -> Optional[str]:
     """
-    Return alert_type ('blacklist' | 'poi') for instant dashboard WebSocket alerts.
+    Return alert_type ('watchlist' | 'poi') for instant dashboard WebSocket alerts.
 
+    Enrolled Blacklist matches must pass alert_type=\"blacklist\" explicitly from
+    the tracker — never infer Blacklist from confidence alone.
     Red WATCHLIST MATCH cards require a real gallery person id — never fire on
     confidence alone (that was creating Passerby / back-of-head red boxes).
     """
@@ -147,9 +149,9 @@ def classify_person_alert(
         if name is not None and _is_auto_capture_name(name):
             return None
     if force:
-        return "blacklist" if conf >= BLACKLIST_ALERT_MIN_CONFIDENCE else "poi"
+        return "watchlist" if conf >= BLACKLIST_ALERT_MIN_CONFIDENCE else "poi"
     if conf >= BLACKLIST_ALERT_MIN_CONFIDENCE:
-        return "blacklist"
+        return "watchlist"
     if conf >= POI_ALERT_MIN_CONFIDENCE:
         return "poi"
     return None
@@ -215,7 +217,7 @@ def publish_person_alert(
     if not kind and not force:
         return None
     if force and not kind:
-        kind = "blacklist" if float(confidence or 0) >= BLACKLIST_ALERT_MIN_CONFIDENCE else "poi"
+        kind = "watchlist" if float(confidence or 0) >= BLACKLIST_ALERT_MIN_CONFIDENCE else "poi"
 
     cam = str(camera or "CAM")
     display = str(name or "Person of Interest")
@@ -261,7 +263,11 @@ def publish_person_alert(
         "bbox": bbox_out,
         "is_poi": True,
         "alert_type": kind,
+        # Legacy ``blacklist`` flag meant "high-confidence alert"; keep it only for
+        # enrolled Blacklist so Watchlist / Blacklist panels stay separate.
         "blacklist": kind == "blacklist",
+        "is_blacklist": kind == "blacklist",
+        "is_watchlist": kind in ("watchlist", "poi"),
     }
 
     line = json.dumps(event, ensure_ascii=False)
@@ -650,7 +656,9 @@ def publish_detection_event(
         if alert_kind:
             event["is_poi"] = True
             event["alert_type"] = alert_kind
-            event["blacklist"] = alert_kind == "blacklist"
+            event["is_watchlist"] = alert_kind in ("watchlist", "poi")
+            event["is_blacklist"] = False
+            event["blacklist"] = False
 
     line = json.dumps(event, ensure_ascii=False)
     with _WRITE_LOCK:
@@ -765,11 +773,12 @@ def _event_face_crop_is_valid(event: Dict[str, Any]) -> bool:
         from captures import (
             capture_display_is_body_crop,
             capture_display_is_full_frame,
+            capture_display_is_person_box,
             display_image_is_portrait_body,
         )
         from face_print_filter import is_likely_invalid_face_crop
 
-        if capture_display_is_full_frame():
+        if capture_display_is_full_frame() or capture_display_is_person_box():
             return True
         img = cv2.imread(str(path))
         if img is None:

@@ -1729,11 +1729,12 @@ def assign_unique_faces_to_persons(
     Without this, the largest overlapping face is greedily given to every person
     box that overlaps it — the second person never gets a crop.
     """
+  # Allow embedding-bearing dets even when quality_ok is soft — supplement scans
+  # often find the second walker only inside a person ROI.
     usable = [
         d
         for d in (face_dets or [])
-        if getattr(d, "quality_ok", False)
-        and getattr(d, "embedding", None) is not None
+        if getattr(d, "embedding", None) is not None
         and getattr(d, "bbox", None) is not None
     ]
     if not person_bboxes or not usable:

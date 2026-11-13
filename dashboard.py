@@ -5,6 +5,8 @@ Web dashboard for AI Visitor Tracking.
   Open http://127.0.0.1:5000
 """
 
+import numpy_compat  # noqa: F401  — NumPy 1.x / 2.x import bridge (must be first)
+
 import argparse
 import base64
 import gc
@@ -132,7 +134,7 @@ def _load_dotenv(path: Path = ENV_PATH) -> None:
 
 _load_dotenv()
 CAMERAS_CONFIG_PATH = PROJECT_DIR / "cameras.json"
-DASHBOARD_UI_VERSION = "21.8"
+DASHBOARD_UI_VERSION = "27.3"
 METRICS_WS_NAMESPACE = "/ws/dashboard_metrics"
 LIVE_VIDEO_WS_NAMESPACE = "/ws/live_video"
 ALERTS_WS_NAMESPACE = "/ws/alerts"
@@ -252,7 +254,7 @@ def enforce_dashboard_auth():
         return None
     if path.startswith("/api/") or path.startswith("/internal/"):
         return jsonify({"error": "Authentication required"}), 401
-    if path.startswith(("/captures/", "/live_preview/", "/stills/", "/runs/")):
+    if path.startswith(("/captures/", "/plate_captures/", "/live_preview/", "/stills/", "/runs/")):
         return jsonify({"error": "Authentication required"}), 401
     return redirect(url_for("login", next=request.path))
 
@@ -782,7 +784,7 @@ def _ensure_detection_counters_bootstrap() -> None:
         try:
             cards = (fetch_tactical_metrics(db_path=get_db_path()).get("cards") or {})
             _detections_today_count = int(cards.get("detections_today", 0))
-            _total_matches_count = int(cards.get("total_matches", 0))
+            _total_matches_count = int(cards.get("new_strangers_today", 0))
         except Exception:
             _detections_today_count = 0
             _total_matches_count = 0
@@ -1648,6 +1650,10 @@ def _run_tactical_target_scan_api(
         return {"error": str(exc), "success": False, "matches": []}, 500
     except Exception as exc:
         _release_scan_session(scan_id)
+        import traceback
+
+        print(f"[SCAN ERROR] {type(exc).__name__}: {exc}")
+        traceback.print_exc()
         msg = str(exc).lower()
         if any(
             token in msg
@@ -3416,9 +3422,29 @@ def logout():
 
 @app.route("/")
 def index():
+    try:
+        from announcement_settings import (
+            announcement_schedule_status,
+            load_announcement_settings,
+        )
+
+        announcement_bootstrap = {
+            "settings": load_announcement_settings(use_cache=False),
+            "status": announcement_schedule_status(),
+        }
+    except Exception:
+        announcement_bootstrap = {
+            "settings": {
+                "schedule_enabled": True,
+                "start_time": "08:00",
+                "end_time": "18:00",
+            },
+            "status": {"label": "8 AM – 6 PM", "active_now": True, "schedule_enabled": True},
+        }
     return render_template(
         "index.html",
         dashboard_version=DASHBOARD_UI_VERSION,
+        announcement_bootstrap=announcement_bootstrap,
     )
 
 
@@ -4140,7 +4166,7 @@ def gen_camera_frames(camera_key: str) -> Generator[bytes, None, None]:
             jpeg = get_camera_jpeg(camera_key)
             if jpeg:
                 yield _mjpeg_chunk(jpeg)
-                time.sleep(0.04)
+                time.sleep(0.033)
                 continue
             placeholder = _placeholder_jpeg(f"{label} - waiting for signal...")
             if placeholder:
@@ -4237,16 +4263,25 @@ def api_cameras():
         # Prefer live JPEG freshness over process-level alive flags (unified tracker
         # reports all cams alive even when RTSP open failed for some).
         preview_alive = False
-        for key in (location, cam_id):
+        try:
+            from live_frame_hub import _safe_camera_key
+        except Exception:
+            _safe_camera_key = lambda k: str(k).strip()  # type: ignore[misc,assignment]
+        for key in (cam_id, location):
             if not key:
                 continue
-            path = preview_dir / f"{key}.jpg"
-            try:
-                if path.is_file() and (now - path.stat().st_mtime) <= preview_max_age_sec:
-                    preview_alive = True
-                    break
-            except OSError:
-                continue
+            for candidate in (str(key), _safe_camera_key(str(key))):
+                if not candidate:
+                    continue
+                path = preview_dir / f"{candidate}.jpg"
+                try:
+                    if path.is_file() and (now - path.stat().st_mtime) <= preview_max_age_sec:
+                        preview_alive = True
+                        break
+                except OSError:
+                    continue
+            if preview_alive:
+                break
         process_alive = bool(st.get("alive", True)) if st else True
         enriched.append(
             {
@@ -4322,30 +4357,44 @@ def _normalize_dashboard_gender(raw: Any) -> str:
     return "Unknown"
 
 
-def _mock_dashboard_stats() -> Dict[str, Any]:
-    day_labels = _last_n_day_labels()
-    total_values = [42, 58, 51, 63, 55, 71, 47]
-    repeat_values = [16, 22, 19, 25, 21, 28, 18]
+def _empty_dashboard_stats(range_key: str = "7d") -> Dict[str, Any]:
+    """Zeroed chart payload — never return demo/fake visitor bars."""
+    range_key = (range_key or "7d").strip().lower()
+    if range_key == "today":
+        labels = ["6am", "9am", "12pm", "3pm", "6pm", "9pm"]
+        caption = "Today (hourly)"
+    elif range_key == "30d":
+        labels = _last_n_day_labels(30)
+        caption = "Past 30 days"
+    else:
+        labels = _last_n_day_labels(7)
+        caption = "Past 7 days"
+    zeros = [0] * len(labels)
     return {
         "age": {
             "labels": ["0–17", "18–29", "30–44", "45–59", "60+", "Unknown"],
-            "values": [8, 34, 52, 28, 14, 5],
+            "values": [0, 0, 0, 0, 0, 0],
         },
         "gender": {
             "labels": ["Male", "Female", "Unknown"],
-            "values": [142, 118, 12],
+            "values": [0, 0, 0],
         },
         "total_visitors": {
-            "labels": day_labels,
-            "values": total_values,
+            "labels": labels,
+            "values": list(zeros),
         },
         "repeat_visitors": {
-            "labels": day_labels,
-            "values": repeat_values,
+            "labels": labels,
+            "values": list(zeros),
         },
         "metrics": {"total": 0, "avgAge": None},
-        "chart_caption": "Past 7 days",
+        "chart_caption": caption,
     }
+
+
+def _mock_dashboard_stats() -> Dict[str, Any]:
+    """Backward-compatible alias — empty stats only (no demo numbers)."""
+    return _empty_dashboard_stats("7d")
 
 
 def _fetch_daily_visit_counts(conn, days: int = 7) -> Tuple[List[str], List[int]]:
@@ -4444,9 +4493,8 @@ def _build_dashboard_stats(conn, range_key: str = "7d") -> Dict[str, Any]:
     if range_key not in ("today", "7d", "30d"):
         range_key = "7d"
 
-    # Real DB counts only — never leave mock age/gender bars (they look clickable
-    # but open an empty gallery when the range truly has no visits).
-    stats = _mock_dashboard_stats()
+    # Real DB counts only — never leave demo visitor bars when the range is empty.
+    stats = _empty_dashboard_stats(range_key)
     age_labels = ["0–17", "18–29", "30–44", "45–59", "60+", "Unknown"]
     age_counts, gender_counts, avg_age = _fetch_demographics_for_range(conn, range_key)
 
@@ -4480,27 +4528,32 @@ def _build_dashboard_stats(conn, range_key: str = "7d") -> Dict[str, Any]:
         "avgAge": avg_age,
     }
 
+    # Always replace demo bars with real series (zeros included).
+    stats["total_visitors"] = {"labels": day_labels, "values": total_values}
     chart_total = sum(total_values)
-    if chart_total > 0 or range_total > 0:
-        stats["total_visitors"] = {"labels": day_labels, "values": total_values}
-        if chart_total > 0:
-            try:
-                from flask import has_request_context
+    if chart_total > 0:
+        try:
+            from flask import has_request_context
 
-                person_id = _person_id_from_request() if has_request_context() else None
-                summary = fetch_summary(conn, person_id=person_id)
-            except Exception:
-                summary = {}
-            unique_people = int(summary.get("unique_people") or 0)
-            total_visits = int(summary.get("total_visits") or chart_total)
-            repeat_ratio = max(
-                0.0,
-                min(1.0, (total_visits - unique_people) / max(total_visits, 1)),
-            )
-            repeat_values = [
-                max(0, round(value * repeat_ratio)) for value in total_values
-            ]
-            stats["repeat_visitors"] = {"labels": day_labels, "values": repeat_values}
+            person_id = _person_id_from_request() if has_request_context() else None
+            summary = fetch_summary(conn, person_id=person_id)
+        except Exception:
+            summary = {}
+        unique_people = int(summary.get("unique_people") or 0)
+        total_visits = int(summary.get("total_visits") or chart_total)
+        repeat_ratio = max(
+            0.0,
+            min(1.0, (total_visits - unique_people) / max(total_visits, 1)),
+        )
+        repeat_values = [
+            max(0, round(value * repeat_ratio)) for value in total_values
+        ]
+        stats["repeat_visitors"] = {"labels": day_labels, "values": repeat_values}
+    else:
+        stats["repeat_visitors"] = {
+            "labels": day_labels,
+            "values": [0] * len(day_labels),
+        }
 
     return stats
 
@@ -4511,7 +4564,7 @@ def api_dashboard_stats():
     range_key = (request.args.get("range") or "7d").strip().lower()
     db = get_db_path()
     if not db.exists():
-        return jsonify(_mock_dashboard_stats())
+        return jsonify(_empty_dashboard_stats(range_key))
     conn = get_connection(db)
     try:
         return jsonify(_build_dashboard_stats(conn, range_key=range_key))
@@ -4520,32 +4573,168 @@ def api_dashboard_stats():
         try:
             range_total = _count_logs_for_range(conn, range_key)
             _, _, avg_age = _fetch_demographics_for_range(conn, range_key)
-            return jsonify(
-                {
-                    "metrics": {"total": range_total, "avgAge": avg_age},
-                    "chart_caption": range_key,
-                }
-            )
+            empty = _empty_dashboard_stats(range_key)
+            empty["metrics"] = {"total": range_total, "avgAge": avg_age}
+            return jsonify(empty)
         except Exception:
-            return jsonify(_mock_dashboard_stats())
+            return jsonify(_empty_dashboard_stats(range_key))
     finally:
         conn.close()
 
 
+@app.route("/api/settings/announcements", methods=["GET", "POST"])
+def api_announcement_settings():
+    """Read or update Telegram announcement time window (dashboard Settings)."""
+    from announcement_settings import (
+        announcement_schedule_status,
+        load_announcement_settings,
+        save_announcement_settings,
+    )
+
+    if request.method == "GET":
+        settings = load_announcement_settings(use_cache=False)
+        status = announcement_schedule_status()
+        resp = jsonify({"ok": True, "settings": settings, "status": status})
+    else:
+        payload = request.get_json(silent=True) or {}
+        try:
+            saved = save_announcement_settings(payload)
+            status = announcement_schedule_status()
+            resp = jsonify({"ok": True, "settings": saved, "status": status})
+        except Exception as exc:
+            app.logger.warning("announcement settings save failed: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 400
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/recent_captures")
 def api_recent_captures():
-    """Recent face/scene captures for the dashboard gallery."""
+    """Face/scene captures for the dashboard Recent Captures gallery.
+
+    Supports ``range=today|7d|30d`` (dashboard time filter). Legacy ``today=1``
+    still means today-only when ``range`` is omitted.
+    """
     if _should_hold_dashboard_data():
         return _scan_hold_json_response([])
     db = get_db_path()
     if not db.exists():
         return jsonify([])
-    limit = max(1, min(request.args.get("limit", 12, type=int), 48))
+    limit = max(1, min(request.args.get("limit", 12, type=int), 500))
+    range_key = (request.args.get("range") or request.args.get("time_range") or "").strip().lower()
+    if range_key in ("week",):
+        range_key = "7d"
+    if range_key in ("month",):
+        range_key = "30d"
+    today_raw = (request.args.get("today") or "").strip().lower()
+    today_only = False
+    if range_key not in ("today", "7d", "30d"):
+        # Legacy: default today-only unless today=0
+        if today_raw in ("0", "false", "no", "all"):
+            range_key = None
+            today_only = False
+        else:
+            range_key = "today"
+            today_only = True
     conn = get_connection(db)
     try:
         from dashboard_data import fetch_live_face_events_as_logs
 
-        return jsonify(fetch_live_face_events_as_logs(conn, limit=limit))
+        return jsonify(
+            fetch_live_face_events_as_logs(
+                conn,
+                limit=limit,
+                today_only=today_only,
+                range_key=range_key,
+            )
+        )
+    finally:
+        conn.close()
+
+
+@app.route("/api/recent_plates")
+def api_recent_plates():
+    """Recent license-plate OCR hits from CCTV cameras."""
+    limit = max(1, min(request.args.get("limit", 48, type=int), 200))
+    range_key = (request.args.get("range") or request.args.get("time_range") or "today").strip().lower()
+    if range_key not in ("today", "7d", "30d", "week", "month"):
+        range_key = "today"
+    if range_key == "week":
+        range_key = "7d"
+    if range_key == "month":
+        range_key = "30d"
+    try:
+        from license_plate_ocr import list_recent_plates
+
+        rows = list_recent_plates(limit=limit, range_key=range_key)
+    except Exception as exc:
+        app.logger.warning("recent_plates failed: %s", exc)
+        rows = []
+    resp = jsonify(
+        {
+            "ok": True,
+            "plates": rows,
+            "count": len(rows),
+            "range": range_key,
+        }
+    )
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/plates/label", methods=["POST"])
+def api_plates_label():
+    """Correct OCR text or mark a plate event resolved/dismissed."""
+    payload = request.get_json(silent=True) or {}
+    filename = str(payload.get("filename") or "").strip()
+    text = str(payload.get("text") or payload.get("plate") or "").strip()
+    review_status = str(payload.get("review_status") or "").strip() or None
+    try:
+        from license_plate_ocr import update_plate_label
+
+        result = update_plate_label(
+            filename=filename,
+            text=text,
+            review_status=review_status,
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    if not result.get("ok"):
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route("/plate_captures/<path:filename>")
+def serve_plate_capture(filename):
+    plate_dir = PROJECT_DIR / "plate_captures"
+    plate_dir.mkdir(parents=True, exist_ok=True)
+    return send_from_directory(plate_dir, filename)
+
+
+@app.route("/api/captures/encounter_cluster")
+def api_capture_encounter_cluster():
+    """Distinct people captured on one camera within a short time window."""
+    if _should_hold_dashboard_data():
+        return _scan_hold_json_response({"ok": True, "entries": [], "count": 0})
+    db = get_db_path()
+    camera = (request.args.get("camera") or request.args.get("camera_location") or "").strip()
+    timestamp = (request.args.get("timestamp") or request.args.get("created_at") or "").strip()
+    window_sec = max(10, min(request.args.get("window_sec", 60, type=int), 180))
+    limit = max(1, min(request.args.get("limit", 8, type=int), 12))
+    if not camera or not timestamp or not db.exists():
+        return jsonify({"ok": True, "entries": [], "count": 0})
+    conn = get_connection(db)
+    try:
+        from dashboard_data import fetch_capture_encounter_cluster
+
+        entries = fetch_capture_encounter_cluster(
+            conn,
+            camera,
+            timestamp,
+            window_sec=window_sec,
+            limit=limit,
+        )
+        return jsonify({"ok": True, "entries": entries, "count": len(entries)})
     finally:
         conn.close()
 
@@ -4827,6 +5016,52 @@ def api_captures_by_time():
                 "range": range_key,
                 "day": day_iso,
                 "label": day_iso,
+                "entries": entries,
+                "count": len(entries),
+                "total": total,
+            }
+        )
+    finally:
+        conn.close()
+
+
+@app.route("/api/captures/by_window")
+def api_captures_by_window():
+    """Captures for dashboard KPI clicks: today or active (last 15 minutes)."""
+    if _should_hold_dashboard_data():
+        return _scan_hold_json_response(
+            {"ok": True, "entries": [], "count": 0, "total": 0}
+        )
+    db = get_db_path()
+    window = (request.args.get("window") or "today").strip().lower()
+    if window in ("active_now", "recent", "15m"):
+        window = "active"
+    if window not in ("today", "active"):
+        window = "today"
+    limit = max(1, min(request.args.get("limit", 96, type=int), 120))
+
+    if not db.exists():
+        return jsonify(
+            {
+                "ok": True,
+                "window": window,
+                "entries": [],
+                "count": 0,
+                "total": 0,
+            }
+        )
+
+    conn = get_connection(db)
+    try:
+        from dashboard_data import count_captures_by_window, fetch_captures_by_window
+
+        entries = fetch_captures_by_window(conn, window, limit=limit)
+        total = count_captures_by_window(conn, window)
+        return jsonify(
+            {
+                "ok": True,
+                "window": window,
+                "label": "Active now" if window == "active" else "Detections today",
                 "entries": entries,
                 "count": len(entries),
                 "total": total,
@@ -5127,7 +5362,7 @@ def go2rtc_proxy(subpath: str):
     """Same-origin proxy to local go2rtc (WebRTC SDP + stream API)."""
     if not is_logged_in():
         return jsonify({"error": "Authentication required"}), 401
-    upstream = (os.environ.get("GO2RTC_URL") or "http://127.0.0.1:1984").rstrip("/")
+    upstream = (os.environ.get("GO2RTC_URL") or "http://127.0.0.1:1986").rstrip("/")
     target = f"{upstream}/{subpath}" if subpath else f"{upstream}/"
     qs = request.query_string.decode("latin-1") if request.query_string else ""
     if qs:
@@ -5263,8 +5498,70 @@ def api_face_intel():
         conn.close()
 
 
+def _person_display_name(conn: sqlite3.Connection, person_id: int) -> str:
+    try:
+        row = conn.execute(
+            "SELECT name FROM known_persons WHERE id = ?",
+            (int(person_id),),
+        ).fetchone()
+        if row is not None:
+            name = str(row[0] or "").strip()
+            if name:
+                return name
+    except (TypeError, ValueError, sqlite3.Error):
+        pass
+    return f"Person #{int(person_id)}"
+
+
+def _enrich_lookup_candidates(
+    conn: sqlite3.Connection,
+    candidates: List[Dict[str, Any]],
+    *,
+    capture_limit: int = 24,
+) -> List[Dict[str, Any]]:
+    """Attach name, profile portrait, and capture thumbnails to lookup hits."""
+    profiles = fetch_profile_images_by_person(conn)
+    enriched: List[Dict[str, Any]] = []
+    for item in candidates:
+        try:
+            pid = int(item["person_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        by_loc = [
+            {"name": name, "visits": count}
+            for name, count in item.get("by_location", [])
+        ]
+        captures = fetch_captures(conn, limit=capture_limit, person_id=pid)
+        profile_url = profiles.get(pid)
+        if profile_url and not str(profile_url).startswith("/"):
+            name = Path(str(profile_url)).name
+            if name:
+                guess = CAPTURES_DIR / "best_faces" / name
+                profile_url = (
+                    f"/captures/best_faces/{name}" if guess.is_file() else None
+                )
+        enriched.append(
+            {
+                "person_id": pid,
+                "name": _person_display_name(conn, pid),
+                "distance": item.get("distance"),
+                "total_visits": item.get("total_visits"),
+                "last_seen": item.get("last_seen"),
+                "source": item.get("source", ""),
+                "by_location": by_loc,
+                "profile_url": profile_url,
+                "captures": captures,
+            }
+        )
+    return enriched
+
+
 def _format_lookup_response(
-    result: dict, no_match_message: str, *, video_duration: Optional[str] = None
+    result: dict,
+    no_match_message: str,
+    *,
+    video_duration: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> tuple:
     """Build JSON body and HTTP status from lookup_photo / lookup_video result."""
     duration_fields: Dict[str, object] = {}
@@ -5290,22 +5587,29 @@ def _format_lookup_response(
             200,
         )
 
-    candidates = []
-    for item in result.get("candidates", []):
-        by_loc = [
-            {"name": name, "visits": count}
-            for name, count in item.get("by_location", [])
-        ]
-        candidates.append(
-            {
-                "person_id": item["person_id"],
-                "distance": item["distance"],
-                "total_visits": item["total_visits"],
-                "last_seen": item.get("last_seen"),
-                "source": item.get("source", ""),
-                "by_location": by_loc,
-            }
-        )
+    raw_candidates = list(result.get("candidates") or [])
+    if conn is not None:
+        candidates = _enrich_lookup_candidates(conn, raw_candidates)
+    else:
+        candidates = []
+        for item in raw_candidates:
+            by_loc = [
+                {"name": name, "visits": count}
+                for name, count in item.get("by_location", [])
+            ]
+            candidates.append(
+                {
+                    "person_id": item["person_id"],
+                    "name": f"Person #{item['person_id']}",
+                    "distance": item["distance"],
+                    "total_visits": item["total_visits"],
+                    "last_seen": item.get("last_seen"),
+                    "source": item.get("source", ""),
+                    "by_location": by_loc,
+                    "profile_url": None,
+                    "captures": [],
+                }
+            )
 
     top = candidates[0] if candidates else {}
     return (
@@ -5314,6 +5618,7 @@ def _format_lookup_response(
                 "matched": True,
                 "candidates": candidates,
                 "person_id": top.get("person_id"),
+                "name": top.get("name"),
                 "total_visits": top.get("total_visits"),
                 "last_seen": top.get("last_seen"),
                 "match_type": result.get("match_type", ""),
@@ -5321,6 +5626,8 @@ def _format_lookup_response(
                 "query_quality": result.get("query_quality"),
                 "profile_upgraded": result.get("profile_upgraded", False),
                 "by_location": top.get("by_location", []),
+                "profile_url": top.get("profile_url"),
+                "captures": top.get("captures") or [],
                 "frames_scanned": result.get("frames_scanned"),
                 "video_frames_total": result.get("video_frames_total"),
                 **duration_fields,
@@ -5357,13 +5664,13 @@ def api_lookup():
         try:
             yolo = get_yolo()
             result = lookup_photo(conn, save_path, yolo_model=yolo)
+            return _format_lookup_response(
+                result,
+                "No person detected. Use a photo with a visible person.",
+                conn=conn,
+            )
         finally:
             conn.close()
-
-        return _format_lookup_response(
-            result,
-            "No person detected. Use a photo with a visible person.",
-        )
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 500
     except Exception as exc:
@@ -5406,14 +5713,14 @@ def search_by_video():
         try:
             yolo = get_yolo()
             result = lookup_video(conn, save_path, yolo_model=yolo)
+            return _format_lookup_response(
+                result,
+                "No face detected in video or no database match.",
+                video_duration=video_duration,
+                conn=conn,
+            )
         finally:
             conn.close()
-
-        return _format_lookup_response(
-            result,
-            "No face detected in video or no database match.",
-            video_duration=video_duration,
-        )
     except VideoCodecError as exc:
         return _video_upload_error_response(exc)
     except FileNotFoundError as exc:
@@ -5525,20 +5832,28 @@ def _watchlist_alert_gate_percent() -> int:
 
 
 @app.route("/api/watchlist/enroll", methods=["POST"])
+@app.route("/api/blacklist/enroll", methods=["POST"])
 @app.route("/api/named/enroll", methods=["POST"])
 def api_watchlist_enroll():
     """
     Enroll one or more face photos into known_persons.
 
-    ``/api/watchlist/enroll`` → watchlist alerts.
+    ``/api/watchlist/enroll`` → Watchlist alerts.
+    ``/api/blacklist/enroll`` → Blacklist alerts (separate list).
     ``/api/named/enroll`` → named gallery (Telegram named alerts, not watchlist).
     """
     as_watchlist = True
+    as_blacklist = False
     path = str(request.path or "")
     mode = (request.form.get("enroll_mode") or "").strip().lower()
     flag = (request.form.get("as_watchlist") or "").strip().lower()
-    if "/named/" in path or mode == "named" or flag in ("0", "false", "no", "off"):
+    bl_flag = (request.form.get("as_blacklist") or "").strip().lower()
+    if "/blacklist/" in path or mode == "blacklist" or bl_flag in ("1", "true", "yes", "on"):
+        as_blacklist = True
         as_watchlist = False
+    elif "/named/" in path or mode == "named" or flag in ("0", "false", "no", "off"):
+        as_watchlist = False
+        as_blacklist = False
     upload_files = []
     for key in ("target_images", "images", "target_image", "image"):
         for item in request.files.getlist(key):
@@ -5586,6 +5901,8 @@ def api_watchlist_enroll():
         per_names.append("")
     if as_watchlist:
         default_name = default_name or "Watchlist Subject"
+    elif as_blacklist:
+        default_name = default_name or "Blacklist Subject"
     elif not default_name and not any(per_names):
         return jsonify(
             {
@@ -5595,6 +5912,7 @@ def api_watchlist_enroll():
         ), 400
     elif not default_name:
         default_name = next((n for n in per_names if n), "Named Person")
+    list_enroll = bool(as_watchlist or as_blacklist)
     labeled_uploads = list(zip(upload_files, per_names[: len(upload_files)]))
 
     force_person_raw = (request.form.get("person_id") or "").strip()
@@ -5682,7 +6000,7 @@ def api_watchlist_enroll():
                 )
             # Named gallery: a new name always creates a new person — never
             # face-merge into someone else (that swapped roster names/photos).
-            if not as_watchlist:
+            if not list_enroll:
                 return None, False, 100
         matched_id, match_distance = find_best_face_match(
             feature, conn, query_quality=quality
@@ -5716,7 +6034,7 @@ def api_watchlist_enroll():
         named_variant_bank: Dict[str, List[Tuple[np.ndarray, float, str]]] = {}
 
         for upload_file, raw_name in labeled_uploads:
-            label = (raw_name or default_name or Path(upload_file.filename).stem.replace("_", " ").strip() or ("Watchlist Subject" if as_watchlist else "Named Person"))[:80]
+            label = (raw_name or default_name or Path(upload_file.filename).stem.replace("_", " ").strip() or ("Blacklist Subject" if as_blacklist else ("Watchlist Subject" if as_watchlist else "Named Person")))[:80]
             suffix = _image_suffix_from_filename(upload_file.filename)
             save_path = SCAN_CACHE_DIR / f"watchlist_enroll_{uuid.uuid4().hex[:10]}{suffix}"
             try:
@@ -5731,7 +6049,7 @@ def api_watchlist_enroll():
             if img is None or img.size == 0:
                 embed_errors.append(f"{upload_file.filename}: could not read image")
                 continue
-            if as_watchlist:
+            if list_enroll:
                 from identity import _embed_scan_reference_face
 
                 embedded = _embed_scan_reference_face(img)
@@ -5812,6 +6130,13 @@ def api_watchlist_enroll():
                             )
                         )
                         encodings_added += 1
+                        if as_blacklist:
+                            try:
+                                from identity import mark_person_blacklist
+
+                                mark_person_blacklist(conn, person_id, blacklist=True)
+                            except Exception:
+                                pass
                         try:
                             upsert_best_face_profile(
                                 conn,
@@ -5819,7 +6144,7 @@ def api_watchlist_enroll():
                                 first_feature,
                                 first_img,
                                 first_quality or 0.0,
-                                allow_named=not as_watchlist,
+                                allow_named=not list_enroll,
                             )
                         except TypeError:
                             try:
@@ -5835,7 +6160,7 @@ def api_watchlist_enroll():
                         except Exception:
                             pass
                         for feature, quality, img, path, _name in rows[1:]:
-                            if as_watchlist:
+                            if list_enroll:
                                 add_encoding_for_person(conn, person_id, feature, quality)
                                 encodings_added += 1
                             else:
@@ -5852,7 +6177,7 @@ def api_watchlist_enroll():
                                     feature,
                                     img,
                                     quality or 0.0,
-                                    allow_named=not as_watchlist,
+                                    allow_named=not list_enroll,
                                 )
                             except TypeError:
                                 try:
@@ -5863,7 +6188,7 @@ def api_watchlist_enroll():
                                     pass
                             except Exception:
                                 pass
-                        if not as_watchlist:
+                        if not list_enroll:
                             # Rotation variants for the first photo (register_person stored upright only).
                             first_path = str(rows[0][3])
                             for feat, q, lab in named_variant_bank.get(first_path) or []:
@@ -5885,15 +6210,24 @@ def api_watchlist_enroll():
                         except Exception:
                             pass
                         try:
-                            from identity import mark_person_named, mark_person_watchlist
+                            from identity import (
+                                mark_person_blacklist,
+                                mark_person_named,
+                                mark_person_watchlist,
+                            )
 
                             mark_person_named(conn, person_id, named=True)
-                            if as_watchlist:
+                            if as_blacklist:
+                                mark_person_blacklist(conn, person_id, blacklist=True)
+                            elif as_watchlist:
                                 mark_person_watchlist(conn, person_id, watchlist=True)
+                            else:
+                                mark_person_watchlist(conn, person_id, watchlist=False)
+                                mark_person_blacklist(conn, person_id, blacklist=False)
                         except Exception:
                             pass
                         for feature, quality, img, path, _name in rows:
-                            if as_watchlist:
+                            if list_enroll:
                                 add_encoding_for_person(conn, person_id, feature, quality)
                                 encodings_added += 1
                             else:
@@ -5910,7 +6244,7 @@ def api_watchlist_enroll():
                                     feature,
                                     img,
                                     quality or 0.0,
-                                    allow_named=not as_watchlist,
+                                    allow_named=not list_enroll,
                                 )
                             except TypeError:
                                 try:
@@ -5926,18 +6260,27 @@ def api_watchlist_enroll():
                         resolve_known_person_name(conn, person_id) or display_name
                     )
                     try:
-                        from identity import mark_person_named, mark_person_watchlist
+                        from identity import (
+                            mark_person_blacklist,
+                            mark_person_named,
+                            mark_person_watchlist,
+                        )
 
                         mark_person_named(conn, person_id, named=True)
-                        if as_watchlist:
+                        if as_blacklist:
+                            mark_person_blacklist(conn, person_id, blacklist=True)
+                        elif as_watchlist:
                             mark_person_watchlist(conn, person_id, watchlist=True)
+                        else:
+                            mark_person_watchlist(conn, person_id, watchlist=False)
+                            mark_person_blacklist(conn, person_id, blacklist=False)
                     except Exception:
                         pass
                     try:
                         _force_enroll_portrait(conn, person_id, rows)
                     except Exception:
                         pass
-                    if not as_watchlist:
+                    if not list_enroll:
                         try:
                             from named_gallery import archive_enroll_batch
 
@@ -6003,8 +6346,9 @@ def api_watchlist_enroll():
                 "photos_skipped": skipped,
                 "encodings_added": total_encodings,
                 "similarity_percent": primary["similarity_percent"],
-                "alert_gate_percent": alert_gate if as_watchlist else None,
+                "alert_gate_percent": alert_gate if list_enroll else None,
                 "is_watchlist": bool(as_watchlist),
+                "is_blacklist": bool(as_blacklist),
                 "is_named": True,
                 "message": (
                     f"Enrolled {len(embedded_rows)} photo(s) across "
@@ -6012,14 +6356,18 @@ def api_watchlist_enroll():
                 ),
                 "telegram_hint": (
                     f"Live cameras will Telegram-alert when a face matches ≥{alert_gate}%."
-                    if as_watchlist
-                    else "Named people are identified on capture. They are not added to the watchlist."
+                    if list_enroll
+                    else "Named people are identified on capture. They are not added to Watchlist/Blacklist."
                 ),
                 "warnings": embed_errors[:5],
             }
         )
     except Exception as exc:
-        kind = "Watchlist" if as_watchlist else "Named people"
+        kind = (
+            "Blacklist"
+            if as_blacklist
+            else ("Watchlist" if as_watchlist else "Named people")
+        )
         return jsonify({"ok": False, "error": f"{kind} enroll failed: {exc}"}), 500
     finally:
         for path in saved_paths:

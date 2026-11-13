@@ -79,6 +79,36 @@ def _detection_trend_vs_yesterday(conn: sqlite3.Connection) -> Optional[float]:
     return round((today_n - yesterday_n) / yesterday_n * 100, 1)
 
 
+def _count_unique_strangers_today(conn: sqlite3.Connection) -> int:
+    """Distinct unknown visitors today (not named, not watchlist), with a saved capture."""
+    today = _today_prefix()
+    try:
+        from dashboard_data import _ensure_overview_person_flags
+
+        _ensure_overview_person_flags(conn)
+    except Exception:
+        pass
+    stranger = (
+        "(tl.known_person_id IS NULL OR ("
+        "COALESCE(kp.is_named, 0) = 0 AND COALESCE(kp.is_watchlist, 0) = 0))"
+    )
+    try:
+        row = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT COALESCE(tl.known_person_id, tl.person_id)) AS c
+            FROM tracking_logs tl
+            LEFT JOIN known_persons kp ON kp.id = tl.known_person_id
+            WHERE tl.timestamp LIKE ?
+              AND {stranger}
+              AND tl.capture_path IS NOT NULL AND TRIM(tl.capture_path) != ''
+            """,
+            (f"{today}%",),
+        ).fetchone()
+        return int(row["c"] or 0) if row else 0
+    except sqlite3.Error:
+        return 0
+
+
 def _card_trends(conn: Optional[sqlite3.Connection]) -> Dict[str, Any]:
     trends: Dict[str, Any] = {
         "detections_pct": None,
@@ -851,6 +881,7 @@ def build_scan_hold_tactical_metrics() -> Dict[str, Any]:
         "scan_hold": True,
         "cards": {
             "detections_today": 0,
+            "new_strangers_today": 0,
             "total_matches": 0,
             "active_cameras": 0,
             "total_cameras": _total_camera_count(),
@@ -914,6 +945,7 @@ def fetch_tactical_metrics(db_path: Optional[Path] = None) -> Dict[str, Any]:
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "cards": {
             "detections_today": 0,
+            "new_strangers_today": 0,
             "total_matches": 0,
             "active_cameras": _active_camera_count(),
             "total_cameras": _total_camera_count(),
@@ -973,6 +1005,7 @@ def fetch_tactical_metrics(db_path: Optional[Path] = None) -> Dict[str, Any]:
             (f"{today}%",),
         ).fetchone()
         avg_age_today = round(float(avg_age_row["avg_age"]), 1) if avg_age_row and avg_age_row["avg_age"] is not None else None
+        new_strangers_today = _count_unique_strangers_today(conn)
         total_matches = conn.execute(
             """
             SELECT COUNT(*) AS c FROM tracking_logs
@@ -988,6 +1021,7 @@ def fetch_tactical_metrics(db_path: Optional[Path] = None) -> Dict[str, Any]:
         metrics["cards"] = {
             "detections_today": int(detections_today),
             "avg_age_today": avg_age_today,
+            "new_strangers_today": int(new_strangers_today),
             "total_matches": int(total_matches),
             "active_cameras": _active_camera_count(),
             "total_cameras": _total_camera_count(),

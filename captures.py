@@ -21,8 +21,11 @@ CAPTURE_MIN_SIDE = 320
 CAPTURE_MAX_UPSCALE = 3.0
 CAPTURE_JPEG_QUALITY = 95
 CAPTURE_FACE_PAD = float(os.environ.get("CAPTURE_FACE_PAD", "0.0"))
-# Display crop: ``upper_body`` = head → waist (default); ``face`` = tight square; ``full_frame`` = scene.
-CAPTURE_DISPLAY_MODE = os.environ.get("CAPTURE_DISPLAY_MODE", "upper_body").strip().lower()
+# Display crop: ``person_box`` = live detect rectangle (default); ``upper_body`` = head→waist; ``face`` / ``full_frame``.
+CAPTURE_DISPLAY_MODE = os.environ.get("CAPTURE_DISPLAY_MODE", "person_box").strip().lower()
+CAPTURE_PERSON_BOX_PAD_RATIO = float(
+    os.environ.get("CAPTURE_PERSON_BOX_PAD_RATIO", "0.02")
+)
 SCENE_MAX_SIDE = int(os.environ.get("CAPTURE_SCENE_MAX_SIDE", "1920"))
 CAPTURE_OUTPUT_SIDE = int(os.environ.get("CAPTURE_OUTPUT_SIDE", "256"))
 CAPTURE_UPPER_BODY_BELOW_FACE_RATIO = float(os.environ.get("CAPTURE_UPPER_BODY_BELOW_FACE_RATIO", "2.2"))
@@ -48,7 +51,7 @@ PERSON_CROP_PAD_RATIO = 0.08
 
 
 def _display_mode() -> str:
-    return (os.environ.get("CAPTURE_DISPLAY_MODE") or "upper_body").strip().lower()
+    return (os.environ.get("CAPTURE_DISPLAY_MODE") or "person_box").strip().lower()
 
 
 def capture_display_is_full_frame() -> bool:
@@ -56,9 +59,24 @@ def capture_display_is_full_frame() -> bool:
     return _display_mode() in ("full_frame", "fullframe", "scene", "frame", "full")
 
 
+def capture_display_is_person_box() -> bool:
+    """True when saves crop exactly to the live YOLO/detect rectangle."""
+    if capture_display_is_full_frame():
+        return False
+    return _display_mode() in (
+        "person_box",
+        "personbox",
+        "bbox",
+        "box",
+        "detect_box",
+        "detection_box",
+        "yolo_box",
+    )
+
+
 def capture_display_is_body_crop() -> bool:
     """True when saves/gallery use head-and-body crops instead of tight face squares."""
-    if capture_display_is_full_frame():
+    if capture_display_is_full_frame() or capture_display_is_person_box():
         return False
     return _display_mode() in (
         "upper_body",
@@ -522,6 +540,7 @@ def display_body_crop_is_valid(crop: np.ndarray) -> bool:
     try:
         from face_print_filter import (
             _horizontal_skin_bands,
+            capture_crop_passes_human_gate,
             is_likely_invalid_face_crop,
             is_likely_rear_view,
             is_likely_streaked_or_corrupt_capture,
@@ -529,6 +548,10 @@ def display_body_crop_is_valid(crop: np.ndarray) -> bool:
 
         streak, _ = is_likely_streaked_or_corrupt_capture(crop)
         if streak:
+            return False
+
+        human_ok, _ = capture_crop_passes_human_gate(crop)
+        if not human_ok:
             return False
 
         top_third = crop[0 : max(1, h // 3)]
@@ -576,9 +599,9 @@ def choose_display_capture_crop(
     """
     Image saved/shown in galleries and alerts.
 
-    Default is a head-to-waist portrait. Never fall back to a tight face square
-    in that mode — that mixed the gallery. Set CAPTURE_DISPLAY_MODE=face only
-    when a hairline-to-chin cut is wanted.
+    ``person_box`` (default): crop to the live detect rectangle (YOLO person /
+    blue frame on CCTV). ``upper_body`` = head-to-waist portrait. ``face`` =
+    tight face square.
     """
     if (
         capture_display_is_full_frame()
@@ -586,6 +609,21 @@ def choose_display_capture_crop(
         and getattr(frame, "size", 0) > 0
     ):
         return _resized_full_frame(frame)
+
+    if capture_display_is_person_box() and frame is not None and getattr(frame, "size", 0) > 0:
+        pad = float(CAPTURE_PERSON_BOX_PAD_RATIO)
+        # Prefer the person detect box drawn on the live stream.
+        if person_bbox is not None:
+            box_crop = crop_person_from_frame(frame, person_bbox, pad_ratio=pad)
+            if box_crop is not None and getattr(box_crop, "size", 0) > 0:
+                return np.ascontiguousarray(box_crop)
+        if face_bbox is not None:
+            # Face-only detect: still crop the rectangle, with a little pad.
+            face_crop = crop_face_from_frame(frame, face_bbox, pad_ratio=max(0.08, pad))
+            if face_crop is not None and getattr(face_crop, "size", 0) > 0:
+                return np.ascontiguousarray(face_crop)
+        return np.ascontiguousarray(aligned_face)
+
     if capture_display_is_body_crop():
         if (
             frame is not None
@@ -786,7 +824,7 @@ def prepare_face_thumbnail(
         out = enhance_face_for_display(face_bgr)
     else:
         out = np.ascontiguousarray(face_bgr)
-    if capture_display_is_full_frame() or capture_display_is_body_crop():
+    if capture_display_is_full_frame() or capture_display_is_body_crop() or capture_display_is_person_box():
         h, w = out.shape[:2]
         thumb_min = int(CAPTURE_THUMB_MIN_SIDE)
         short = min(h, w)

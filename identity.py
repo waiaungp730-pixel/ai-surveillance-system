@@ -3,8 +3,10 @@ Face-based identity: match people across visits and photo lookups.
 
 Live CCTV + video scan prefer InsightFace (RetinaFace + ArcFace) on CUDA when
 onnxruntime-gpu is available. OpenCV YuNet + SFace remain as CPU fallback for
-photo lookup and legacy gallery embeddings.
+legacy paths only — photo search uses ArcFace so it matches the gallery.
 """
+
+import numpy_compat  # noqa: F401  — unpickle NumPy 2 gallery blobs on NumPy 1.x
 
 import base64
 import glob
@@ -87,9 +89,20 @@ NAMED_TRACK_MEMORY_MAX_DIST = float(
 )
 _NAMED_SIGHTING_MEMORY: Dict[str, List[Dict[str, object]]] = {}
 _NAMED_SIGHTING_MEMORY_LOCK = threading.Lock()
-# Dashboard photo upload only — looser than CCTV so lighting/angle/quality still match.
-PHOTO_SEARCH_MATCH_THRESHOLD = 0.68
+# Dashboard photo upload — cosine distance (lower = stricter).
+# 0.50 ≈ live CCTV gate. 0.68 was letting weak looking-down CCTV faces through
+# as false positives when a clear enrollment photo already matched strongly.
+try:
+    PHOTO_SEARCH_MATCH_THRESHOLD = min(
+        0.85,
+        max(0.20, float(os.environ.get("PHOTO_SEARCH_MATCH_THRESHOLD", "0.50"))),
+    )
+except ValueError:
+    PHOTO_SEARCH_MATCH_THRESHOLD = 0.50
 MULTI_MATCH_THRESHOLD = PHOTO_SEARCH_MATCH_THRESHOLD
+# When the top hit is very strong, drop far weaker gallery noise.
+PHOTO_SEARCH_STRONG_BEST = 0.25
+PHOTO_SEARCH_STRONG_MAX_GAP = 0.20
 BLURRY_SHARPNESS_THRESHOLD = 60.0
 # Soft CCTV faces (laplacian below this) still try Named People with a looser gate
 # and recent sighting memory — so enrolled names show even when the crop is soft.
@@ -302,6 +315,15 @@ def ensure_watchlist_flag_column(conn: sqlite3.Connection) -> None:
         )
 
 
+def ensure_blacklist_flag_column(conn: sqlite3.Connection) -> None:
+    """Separate Blacklist enroll list (mutually exclusive with Watchlist)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(known_persons)")}
+    if "is_blacklist" not in cols:
+        conn.execute(
+            "ALTER TABLE known_persons ADD COLUMN is_blacklist INTEGER NOT NULL DEFAULT 0"
+        )
+
+
 def ensure_named_flag_column(conn: sqlite3.Connection) -> None:
     """People enrolled in the Named gallery (or watchlist) — used for live ID."""
     cols = {row[1] for row in conn.execute("PRAGMA table_info(known_persons)")}
@@ -348,10 +370,40 @@ def mark_person_watchlist(
     watchlist: bool = True,
 ) -> None:
     ensure_watchlist_flag_column(conn)
-    conn.execute(
-        "UPDATE known_persons SET is_watchlist = ? WHERE id = ?",
-        (1 if watchlist else 0, int(known_person_id)),
-    )
+    ensure_blacklist_flag_column(conn)
+    kid = int(known_person_id)
+    if watchlist:
+        # Watchlist and Blacklist are separate lists.
+        conn.execute(
+            "UPDATE known_persons SET is_watchlist = 1, is_blacklist = 0 WHERE id = ?",
+            (kid,),
+        )
+    else:
+        conn.execute(
+            "UPDATE known_persons SET is_watchlist = 0 WHERE id = ?",
+            (kid,),
+        )
+
+
+def mark_person_blacklist(
+    conn: sqlite3.Connection,
+    known_person_id: int,
+    *,
+    blacklist: bool = True,
+) -> None:
+    ensure_watchlist_flag_column(conn)
+    ensure_blacklist_flag_column(conn)
+    kid = int(known_person_id)
+    if blacklist:
+        conn.execute(
+            "UPDATE known_persons SET is_blacklist = 1, is_watchlist = 0 WHERE id = ?",
+            (kid,),
+        )
+    else:
+        conn.execute(
+            "UPDATE known_persons SET is_blacklist = 0 WHERE id = ?",
+            (kid,),
+        )
 
 
 def mark_person_named(
@@ -449,6 +501,98 @@ def delete_named_gallery_people(conn: sqlite3.Connection) -> Dict[str, int]:
     return {"deleted_people": len(ids), "deleted_images": images_removed}
 
 
+def _resolve_capture_image_path(raw_path: Optional[str]) -> Optional[Path]:
+    """Map a tracking_logs capture_path to an on-disk JPEG."""
+    if not raw_path:
+        return None
+    rel = str(raw_path).strip().replace("\\", "/").lstrip("/")
+    if not rel:
+        return None
+    if rel.startswith("captures/"):
+        rel = rel[len("captures/") :]
+    candidates = [
+        CAPTURES_DIR / Path(rel).name,
+        CAPTURES_DIR / rel,
+        PROJECT_DIR / rel,
+        PROJECT_DIR / "captures" / Path(rel).name,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _enroll_labeled_capture_face(
+    conn: sqlite3.Connection,
+    known_id: int,
+    capture_path: Optional[str],
+) -> bool:
+    """
+    Re-embed the labeled capture into Named People gallery so later CCTV
+    sightings reuse the same ``known_person_id``.
+    """
+    path = _resolve_capture_image_path(capture_path)
+    if path is None:
+        return False
+    img = load_bgr_image_oriented(path)
+    if img is None or getattr(img, "size", 0) == 0:
+        img = cv2.imread(str(path))
+    if img is None or getattr(img, "size", 0) == 0:
+        return False
+
+    feature: Optional[np.ndarray] = None
+    quality = float(face_sharpness(img))
+    try:
+        embedded = _embed_scan_reference_face(img)
+        if embedded is not None:
+            feature, meta = embedded
+            try:
+                if isinstance(meta, dict) and meta.get("quality") is not None:
+                    quality = float(meta["quality"])
+            except Exception:
+                pass
+    except Exception:
+        feature = None
+    if feature is None:
+        try:
+            variants = embed_named_enrollment_variants(img)
+            if variants:
+                feature, quality, _label = variants[0]
+        except Exception:
+            feature = None
+    if feature is None:
+        return False
+
+    flat = np.asarray(feature, dtype=np.float32).reshape(-1)
+    if int(flat.size) != 512:
+        return False
+
+    # Named rematch reads person_best_faces — force-update from this labeled crop.
+    upsert_best_face_profile(
+        conn,
+        int(known_id),
+        flat,
+        img,
+        float(quality) if np.isfinite(quality) else 1.0,
+        allow_named=True,
+    )
+    try:
+        add_encoding_for_person(conn, int(known_id), flat, quality)
+    except Exception:
+        pass
+    try:
+        from named_gallery import add_gallery_photo_from_array
+
+        add_gallery_photo_from_array(int(known_id), img)
+    except Exception:
+        pass
+    try:
+        refresh_gpu_face_index(conn)
+    except Exception:
+        pass
+    return True
+
+
 def label_captured_person(
     conn: sqlite3.Connection,
     name: str,
@@ -457,7 +601,10 @@ def label_captured_person(
     known_person_id: Optional[int] = None,
 ) -> Dict[str, object]:
     """
-    Save a human name on a capture / gallery person without watchlist enrollment.
+    Save a human name on a capture and enroll that face for rematch.
+
+    Without enrollment, the next CCTV sighting often mints a new stranger ID.
+    This path keeps ``known_person_id`` stable across later catches (not watchlist).
     """
     display = str(name or "").strip()[:80]
     if not display:
@@ -474,23 +621,106 @@ def label_captured_person(
     if log_id is not None and str(log_id).strip() != "":
         lid = int(log_id)
 
+    capture_path: Optional[str] = None
+    log_row = None
     if lid is not None:
-        row = conn.execute(
-            "SELECT id, known_person_id FROM tracking_logs WHERE id = ?",
+        log_row = conn.execute(
+            """
+            SELECT id, known_person_id, capture_path, scene_path
+            FROM tracking_logs WHERE id = ?
+            """,
             (lid,),
         ).fetchone()
-        if row is None:
+        if log_row is None:
             raise ValueError("Capture not found")
         conn.execute(
             "UPDATE tracking_logs SET display_name = ? WHERE id = ?",
             (display, lid),
         )
         if kid is None:
-            raw = row["known_person_id"] if isinstance(row, sqlite3.Row) else row[1]
+            raw = (
+                log_row["known_person_id"]
+                if isinstance(log_row, sqlite3.Row)
+                else log_row[1]
+            )
             if raw is not None and str(raw).strip() != "":
                 kid = int(raw)
+        capture_path = (
+            log_row["capture_path"]
+            if isinstance(log_row, sqlite3.Row)
+            else log_row[2]
+        )
+        if not capture_path:
+            capture_path = (
+                log_row["scene_path"]
+                if isinstance(log_row, sqlite3.Row)
+                else log_row[3]
+            )
 
-    if kid is not None:
+    enrolled = False
+    created = False
+
+    # No gallery ID yet — create one from this capture so later sightings can reuse it.
+    if kid is None:
+        if not capture_path:
+            raise ValueError("Need a capture with a face image to assign a lasting ID")
+        path = _resolve_capture_image_path(str(capture_path))
+        if path is None:
+            raise ValueError("Capture image not found on disk")
+        img = load_bgr_image_oriented(path)
+        if img is None or getattr(img, "size", 0) == 0:
+            img = cv2.imread(str(path))
+        if img is None or getattr(img, "size", 0) == 0:
+            raise ValueError("Could not read capture image")
+        feature = None
+        quality = float(face_sharpness(img))
+        try:
+            embedded = _embed_scan_reference_face(img)
+            if embedded is not None:
+                feature, meta = embedded
+                try:
+                    if isinstance(meta, dict) and meta.get("quality") is not None:
+                        quality = float(meta["quality"])
+                except Exception:
+                    pass
+        except Exception:
+            feature = None
+        if feature is None:
+            raise ValueError("Could not read a face from this capture to assign an ID")
+        kid = register_person(
+            conn,
+            feature,
+            quality_score=quality,
+            name=display,
+            watchlist=False,
+            named=True,
+        )
+        created = True
+        enrolled = True
+        if lid is not None:
+            conn.execute(
+                "UPDATE tracking_logs SET known_person_id = ?, display_name = ? WHERE id = ?",
+                (kid, display, lid),
+            )
+        try:
+            upsert_best_face_profile(
+                conn,
+                int(kid),
+                np.asarray(feature, dtype=np.float32).reshape(-1),
+                img,
+                float(quality) if np.isfinite(quality) else 1.0,
+                allow_named=True,
+            )
+        except Exception:
+            pass
+        try:
+            from named_gallery import add_gallery_photo_from_array
+
+            add_gallery_photo_from_array(int(kid), img)
+        except Exception:
+            pass
+
+    if kid is not None and not created:
         exists = conn.execute(
             "SELECT id FROM known_persons WHERE id = ?",
             (kid,),
@@ -498,13 +728,24 @@ def label_captured_person(
         if exists is None:
             raise ValueError("Person not found")
         conn.execute(
-            "UPDATE known_persons SET name = ?, is_named = 1 WHERE id = ?",
+            """
+            UPDATE known_persons
+            SET name = ?, is_named = 1, is_watchlist = 0
+            WHERE id = ?
+            """,
             (display, kid),
         )
         conn.execute(
             "UPDATE tracking_logs SET display_name = ? WHERE known_person_id = ?",
             (display, kid),
         )
+        if lid is not None:
+            conn.execute(
+                "UPDATE tracking_logs SET known_person_id = ? WHERE id = ?",
+                (kid, lid),
+            )
+        if capture_path:
+            enrolled = _enroll_labeled_capture_face(conn, int(kid), str(capture_path))
 
     if kid is None and lid is None:
         raise ValueError("Need a capture id or person id")
@@ -527,6 +768,8 @@ def label_captured_person(
         "known_person_id": kid,
         "log_id": lid,
         "is_watchlist": False,
+        "enrolled": bool(enrolled or created),
+        "created": bool(created),
     }
 
 
@@ -883,22 +1126,34 @@ def resolve_live_capture_identity(
 def is_enrolled_watchlist_person(
     conn: sqlite3.Connection, known_person_id: Optional[int]
 ) -> bool:
-    """True only for people enrolled onto the watchlist (not capture labels)."""
+    """True only for people enrolled onto the Watchlist (not Blacklist / labels)."""
     if known_person_id is None:
         return False
     kid = int(known_person_id)
     try:
         ensure_watchlist_flag_column(conn)
+        ensure_blacklist_flag_column(conn)
         row = conn.execute(
-            "SELECT is_watchlist, name FROM known_persons WHERE id = ?",
+            """
+            SELECT is_watchlist, is_blacklist, name
+            FROM known_persons WHERE id = ?
+            """,
             (kid,),
         ).fetchone()
         if row is None:
             return False
-        flag = row["is_watchlist"] if isinstance(row, sqlite3.Row) else row[0]
-        if flag is not None:
-            return int(flag) == 1
-        name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        if isinstance(row, sqlite3.Row):
+            if int(row["is_blacklist"] or 0) == 1:
+                return False
+            if row["is_watchlist"] is not None:
+                return int(row["is_watchlist"]) == 1
+            name = row["name"]
+        else:
+            if int(row[1] or 0) == 1:
+                return False
+            if row[0] is not None:
+                return int(row[0]) == 1
+            name = row[2]
         return not is_auto_identity_name(name)
     except Exception:
         try:
@@ -909,16 +1164,46 @@ def is_enrolled_watchlist_person(
             return False
 
 
+def is_enrolled_blacklist_person(
+    conn: sqlite3.Connection, known_person_id: Optional[int]
+) -> bool:
+    """True only for people enrolled onto the Blacklist."""
+    if known_person_id is None:
+        return False
+    kid = int(known_person_id)
+    try:
+        ensure_blacklist_flag_column(conn)
+        row = conn.execute(
+            "SELECT is_blacklist FROM known_persons WHERE id = ?",
+            (kid,),
+        ).fetchone()
+        if row is None:
+            return False
+        flag = row["is_blacklist"] if isinstance(row, sqlite3.Row) else row[0]
+        return int(flag or 0) == 1
+    except Exception:
+        return False
+
+
+def is_enrolled_alert_person(
+    conn: sqlite3.Connection, known_person_id: Optional[int]
+) -> bool:
+    """Watchlist or Blacklist enrollment (either list gets match priority)."""
+    return is_enrolled_watchlist_person(conn, known_person_id) or is_enrolled_blacklist_person(
+        conn, known_person_id
+    )
+
+
 def _pick_match_preferring_enrolled(
     candidates: Sequence[Tuple[int, float]],
     conn: sqlite3.Connection,
     threshold: float,
 ) -> Tuple[Optional[int], float]:
     """
-    Prefer enrolled watchlist IDs over auto Stranger_* gallery noise.
+    Prefer enrolled Watchlist / Blacklist IDs over auto Stranger_* gallery noise.
 
     Auto-captures flood FAISS/Qdrant; without this preference, enrolled people
-    rarely win and CCTV watchlist alerts never fire.
+    rarely win and CCTV list alerts never fire.
     """
     under: List[Tuple[int, float]] = []
     for pid, dist in candidates:
@@ -941,7 +1226,7 @@ def _pick_match_preferring_enrolled(
     enrolled = [
         (i, d)
         for i, d in under
-        if is_named_person(conn, i) or is_enrolled_watchlist_person(conn, i)
+        if is_named_person(conn, i) or is_enrolled_alert_person(conn, i)
     ]
     pool = enrolled if enrolled else under
     pool.sort(key=lambda x: x[1])
@@ -1020,6 +1305,7 @@ def init_identity_db(conn: sqlite3.Connection) -> None:
     )
     ensure_known_person_name_column(conn)
     ensure_watchlist_flag_column(conn)
+    ensure_blacklist_flag_column(conn)
     ensure_named_flag_column(conn)
     ensure_log_display_name_column(conn)
     conn.execute(
@@ -2176,7 +2462,17 @@ def _largest_person_bbox(img: np.ndarray, yolo_model) -> Optional[np.ndarray]:
 
 
 def _blob_to_feature(blob: bytes) -> np.ndarray:
-    return pickle.loads(blob)
+    """Unpickle a stored embedding (NumPy 1.x / 2.x pickle compatible)."""
+    try:
+        return pickle.loads(blob)
+    except ModuleNotFoundError as exc:
+        # Gallery blobs pickled under NumPy 2 reference numpy._core.*
+        if "numpy._core" not in str(exc):
+            raise
+        import numpy_compat as _np_compat
+
+        _np_compat.apply_numpy_core_alias()
+        return pickle.loads(blob)
 
 
 def _feature_to_blob(feature: np.ndarray) -> bytes:
@@ -2238,12 +2534,19 @@ def _normalize_face_feature(feature: np.ndarray) -> Optional[np.ndarray]:
 
 
 def _distance(f1: np.ndarray, f2: np.ndarray) -> float:
-    _, recognizer = load_face_models()
     left = _normalize_face_feature(f1)
     right = _normalize_face_feature(f2)
     if left is None or right is None:
         return float("inf")
+    if int(left.shape[1]) != int(right.shape[1]):
+        return float("inf")
 
+    # Gallery is InsightFace ArcFace (512-d). Use cosine — do not send ArcFace
+    # vectors through OpenCV SFace matcher (128-d only).
+    if int(left.shape[1]) == 512:
+        return _arcface_embedding_distance(left, right)
+
+    _, recognizer = load_face_models()
     score = recognizer.match(left, right, cv2.FaceRecognizerSF_FR_COSINE)
     # မြန်မာ: OpenCV ရလဒ် ဗလာ/ပုံစံမမှန်ပါက tuple index out of range မဖြစ်စေရန်
     from orion_frame_pipeline import safe_match_score
@@ -2479,6 +2782,23 @@ def find_face_matches(
                 f"min distance {dist:.3f} > {threshold:.2f}"
             )
 
+    # Suppress weak secondary hits when the best match is already decisive
+    # (e.g. enrollment selfie vs noisy looking-down stranger crops).
+    if (
+        matches
+        and float(threshold) >= float(PHOTO_SEARCH_MATCH_THRESHOLD) - 1e-9
+        and float(matches[0]["distance"]) <= PHOTO_SEARCH_STRONG_BEST
+    ):
+        best = float(matches[0]["distance"])
+        cap = best + PHOTO_SEARCH_STRONG_MAX_GAP
+        filtered = [m for m in matches if float(m["distance"]) <= cap]
+        if log_candidates > 0 and len(filtered) < len(matches):
+            print(
+                f"[FACE MATCH] Strong-best filter: kept {len(filtered)}/"
+                f"{len(matches)} (best={best:.3f}, cap={cap:.3f})"
+            )
+        matches = filtered
+
     if log_candidates > 0 and not matches and scored:
         print(
             f"[FACE MATCH] No match — closest Person #{scored[0][0]} "
@@ -2633,6 +2953,8 @@ def find_best_face_match(
     conn: sqlite3.Connection,
     query_quality: Optional[float] = None,
     log_candidates: int = 0,
+    *,
+    camera_location: Optional[str] = None,
 ) -> Tuple[Optional[int], float]:
     named_id, named_dist = _find_named_gallery_match(
         feature, conn, log_candidates=log_candidates
@@ -2677,6 +2999,16 @@ def find_best_face_match(
                 )
                 if best_id is not None:
                     return int(best_id), float(best_dist)
+                # Day-2 / overnight: reuse unlabeled stranger even when slightly
+                # over the strict watchlist gate.
+                soft_hit = _soft_stranger_rematch(
+                    scored_q,
+                    conn,
+                    camera_location=camera_location,
+                    log_candidates=log_candidates,
+                )
+                if soft_hit is not None:
+                    return soft_hit
         except Exception:
             pass
 
@@ -2704,6 +3036,14 @@ def find_best_face_match(
                 )
                 if best_id is not None:
                     return int(best_id), float(best_dist)
+                soft_hit = _soft_stranger_rematch(
+                    scored,
+                    conn,
+                    camera_location=camera_location,
+                    log_candidates=log_candidates,
+                )
+                if soft_hit is not None:
+                    return soft_hit
                 if log_candidates > 0:
                     print(
                         f"[FACE MATCH] FAISS miss — best distance {best_dist:.3f} "
@@ -2743,12 +3083,256 @@ def find_best_face_match(
     if best_id is not None:
         return best_id, best_dist
 
+    soft_hit = _soft_stranger_rematch(
+        scored_rows,
+        conn,
+        camera_location=camera_location,
+        log_candidates=log_candidates,
+    )
+    if soft_hit is not None:
+        return soft_hit
+
     if log_candidates > 0:
         print(
             f"[FACE MATCH] No match — best distance {best_dist:.3f} "
             f"> threshold {threshold:.2f}"
         )
     return None, best_dist
+
+
+def _recent_camera_stranger_ids(
+    conn: sqlite3.Connection,
+    camera_location: str,
+    *,
+    minutes: int = 20,
+) -> Set[int]:
+    """known_person_ids logged on this camera in the last N minutes."""
+    cam = str(camera_location or "").strip()
+    if not cam:
+        return set()
+    cam_key = cam.upper().replace("CAM-", "").replace("CAM", "").strip() or cam
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT known_person_id
+            FROM tracking_logs
+            WHERE known_person_id IS NOT NULL
+              AND datetime(timestamp) >= datetime('now', ?)
+              AND (
+                    camera_location = ?
+                 OR camera_location = ?
+                 OR REPLACE(UPPER(camera_location), 'CAM-', '') = ?
+              )
+            """,
+            (f"-{max(1, int(minutes))} minutes", cam, f"CAM-{cam_key}", cam_key),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    out: Set[int] = set()
+    for row in rows:
+        raw = row[0] if not isinstance(row, sqlite3.Row) else row["known_person_id"]
+        try:
+            out.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _prior_stranger_ids(
+    conn: sqlite3.Connection,
+    *,
+    days: int = 14,
+) -> Set[int]:
+    """
+    Unlabeled stranger IDs seen in the last N days (cross-day rematch pool).
+
+    Named / watchlist people are excluded — they already match via the
+    strict named/watchlist path. This set keeps ``Stranger_42`` stable when
+    the same face returns tomorrow.
+    """
+    try:
+        lookback = max(1, int(days))
+    except (TypeError, ValueError):
+        lookback = 14
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT kp.id
+            FROM known_persons kp
+            WHERE COALESCE(kp.is_named, 0) = 0
+              AND COALESCE(kp.is_watchlist, 0) = 0
+              AND (
+                    datetime(COALESCE(kp.last_seen, kp.created_at))
+                        >= datetime('now', ?)
+                 OR EXISTS (
+                        SELECT 1 FROM tracking_logs tl
+                        WHERE tl.known_person_id = kp.id
+                          AND datetime(tl.timestamp) >= datetime('now', ?)
+                    )
+              )
+              AND (
+                    EXISTS (
+                        SELECT 1 FROM person_encodings pe
+                        WHERE pe.known_person_id = kp.id
+                    )
+                 OR EXISTS (
+                        SELECT 1 FROM person_best_faces bf
+                        WHERE bf.known_person_id = kp.id
+                    )
+              )
+            """,
+            (f"-{lookback} days", f"-{lookback} days"),
+        ).fetchall()
+    except sqlite3.Error:
+        return set()
+    out: Set[int] = set()
+    for row in rows:
+        raw = row[0] if not isinstance(row, sqlite3.Row) else row["id"]
+        try:
+            out.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _soft_stranger_candidates(
+    scored_rows: Sequence,
+) -> List[Tuple[int, float]]:
+    """Normalize scored rows to ``(person_id, distance)`` sorted ascending."""
+    out: List[Tuple[int, float]] = []
+    for row in scored_rows:
+        try:
+            kid = int(row[0])
+            dist = float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not np.isfinite(dist):
+            continue
+        out.append((kid, dist))
+    out.sort(key=lambda item: item[1])
+    return out
+
+
+def _soft_stranger_rematch(
+    scored_rows: Sequence,
+    conn: sqlite3.Connection,
+    *,
+    camera_location: Optional[str] = None,
+    log_candidates: int = 0,
+) -> Optional[Tuple[int, float]]:
+    """
+    Reuse an existing unlabeled stranger ID when the face is near the strict gate.
+
+    Priority:
+    1. Same-camera sightings in the last ~20 minutes (looser gate)
+    2. Any stranger seen in the last N days (cross-day / next-day same ID)
+    3. Any unlabeled stranger under the soft distance floor
+
+    A small margin vs the next candidate reduces wrong merges overnight.
+    """
+    candidates = _soft_stranger_candidates(scored_rows)
+    if not candidates:
+        return None
+    try:
+        soft_max = float(os.environ.get("STRANGER_REMATCH_MAX_DIST", "0.60"))
+    except (TypeError, ValueError):
+        soft_max = 0.60
+    soft_max = max(float(MATCH_THRESHOLD), min(soft_max, 0.68))
+    try:
+        cross_day_max = float(os.environ.get("STRANGER_CROSS_DAY_MAX_DIST", "0.62"))
+    except (TypeError, ValueError):
+        cross_day_max = 0.62
+    cross_day_max = max(soft_max, min(cross_day_max, 0.70))
+    try:
+        cross_day_days = int(os.environ.get("STRANGER_CROSS_DAY_DAYS", "14"))
+    except (TypeError, ValueError):
+        cross_day_days = 14
+    try:
+        min_margin = float(os.environ.get("STRANGER_REMATCH_MARGIN", "0.02"))
+    except (TypeError, ValueError):
+        min_margin = 0.02
+
+    recent = _recent_camera_stranger_ids(conn, str(camera_location or ""))
+    prior = _prior_stranger_ids(conn, days=cross_day_days)
+    # Same camera, last ~20 min: allow a slightly looser gate.
+    cam_soft = min(0.64, soft_max + 0.04) if recent else soft_max
+
+    def _ok_stranger(pid: int) -> bool:
+        try:
+            return (
+                not is_named_person(conn, int(pid))
+                and not is_enrolled_watchlist_person(conn, int(pid))
+            )
+        except Exception:
+            return False
+
+    def _margin_ok(best_dist: float, pool: Sequence[Tuple[int, float]]) -> bool:
+        """Require clear separation from the next stranger under the same gate."""
+        under = [(pid, d) for pid, d in pool if d <= best_dist + max(min_margin, 0.0) + 0.05]
+        if len(under) <= 1:
+            return True
+        # Next distinct person must be clearly farther.
+        second = None
+        best_pid = under[0][0]
+        for pid, d in under[1:]:
+            if int(pid) != int(best_pid):
+                second = d
+                break
+        if second is None:
+            return True
+        return float(second) - float(best_dist) >= float(min_margin)
+
+    if recent:
+        for kid, dist in candidates:
+            if dist > cam_soft:
+                break
+            if int(kid) in recent and _ok_stranger(int(kid)):
+                if log_candidates > 0:
+                    print(
+                        f"[FACE MATCH] Same-cam stranger rematch Person #{int(kid)} "
+                        f"at {dist:.3f} (gate {cam_soft:.2f})"
+                    )
+                return int(kid), dist
+
+    # Cross-day: prefer strangers already in the gallery from prior days.
+    if prior:
+        prior_hits = [
+            (kid, dist)
+            for kid, dist in candidates
+            if dist <= cross_day_max and int(kid) in prior and _ok_stranger(int(kid))
+        ]
+        if prior_hits and _margin_ok(prior_hits[0][1], prior_hits):
+            kid, dist = prior_hits[0]
+            if log_candidates > 0:
+                print(
+                    f"[FACE MATCH] Cross-day stranger rematch Person #{int(kid)} "
+                    f"at {dist:.3f} (gate {cross_day_max:.2f}, lookback {cross_day_days}d)"
+                )
+            return int(kid), dist
+
+    for kid, dist in candidates:
+        if dist > soft_max:
+            break
+        if _ok_stranger(int(kid)):
+            pool = [
+                (k, d)
+                for k, d in candidates
+                if d <= soft_max and _ok_stranger(int(k))
+            ]
+            if not _margin_ok(dist, pool):
+                if log_candidates > 0:
+                    print(
+                        f"[FACE MATCH] Soft stranger rematch skipped Person #{int(kid)} "
+                        f"at {dist:.3f} — ambiguous vs other strangers"
+                    )
+                return None
+            if log_candidates > 0:
+                print(
+                    f"[FACE MATCH] Soft stranger rematch Person #{int(kid)} "
+                    f"at {dist:.3f} (gate {soft_max:.2f})"
+                )
+            return int(kid), dist
+    return None
 
 
 def find_best_body_match(
@@ -3071,15 +3655,24 @@ def resolve_known_person_from_face(
     face_feature: np.ndarray,
     session_map: Dict[int, int],
     track_id: int,
+    *,
+    camera_location: Optional[str] = None,
 ) -> Optional[int]:
     """Assign identity from a face feature only (no body fallback)."""
     if track_id in session_map:
         return session_map[track_id]
 
+    def _match(feature: np.ndarray, db: sqlite3.Connection):
+        return find_best_face_match(
+            feature,
+            db,
+            camera_location=camera_location,
+        )
+
     known_id = _assign_identity(
         conn,
         face_feature,
-        find_best_face_match,
+        _match,
         register_person,
         add_encoding_for_person,
         "face",
@@ -4632,7 +5225,28 @@ def lookup_photo(
     face_crop = None
     candidates: List[dict] = []
 
-    if models_ready():
+    # Prefer InsightFace ArcFace (512-d) — same model as the CCTV gallery.
+    # OpenCV SFace (128-d) cannot match ArcFace embeddings and always misses.
+    packed = _embed_scan_reference_face(img)
+    if packed is not None:
+        face_feat, meta = packed
+        if isinstance(meta, dict):
+            debug = meta.get("debug") if isinstance(meta.get("debug"), dict) else {}
+            aligned = debug.get("aligned_bgr")
+            if aligned is not None and getattr(aligned, "size", 0):
+                face_crop = aligned
+            query_quality = float(meta.get("quality") or 0.0) or face_sharpness(
+                face_crop if face_crop is not None else img
+            )
+        if face_crop is None:
+            face_crop = _crop_largest_face_with_padding(img, pad_ratio=0.10)
+            if query_quality <= 0:
+                query_quality = face_sharpness(
+                    face_crop if face_crop is not None else img
+                )
+
+    if face_feat is None and models_ready():
+        # CPU / legacy fallback only when ArcFace stack is unavailable.
         face_crop = _crop_largest_face_with_padding(img, pad_ratio=0.10)
         if face_crop is not None:
             direct = _detect_largest_face(face_crop)
@@ -4642,25 +5256,31 @@ def lookup_photo(
         if face_feat is None:
             face_feat = encoding_from_bgr_image(img, yolo_model=yolo_model)
             query_quality = face_sharpness(face_crop if face_crop is not None else img)
-        if face_feat is not None:
-            if _normalize_face_feature(face_feat) is None:
-                empty["message"] = (
-                    "Invalid face embedding from uploaded image. Try a clearer photo."
-                )
-                return empty
 
-            candidates, profile_upgraded, match_type = _match_candidates_from_face(
-                conn,
-                face_feat,
-                query_quality,
-                face_crop,
-                img,
+    if face_feat is not None:
+        if _normalize_face_feature(face_feat) is None:
+            empty["message"] = (
+                "Invalid face embedding from uploaded image. Try a clearer photo."
             )
+            return empty
+
+        candidates, profile_upgraded, match_type = _match_candidates_from_face(
+            conn,
+            face_feat,
+            query_quality,
+            face_crop,
+            img,
+        )
 
     if not candidates:
         bbox = _largest_person_bbox(img, yolo_model)
         if bbox is not None:
-            body_feat = body_embedding_from_frame_bbox(img, bbox)
+            try:
+                body_feat = body_embedding_from_frame_bbox(img, bbox)
+            except (ImportError, FileNotFoundError, ModuleNotFoundError) as exc:
+                # Face search must not hard-fail when OSNet/torchreid/numpy extras are missing.
+                print(f"[LOOKUP] Body Re-ID skipped: {exc}")
+                body_feat = None
             if body_feat is not None:
                 known_id, dist = find_best_body_match(body_feat, conn)
                 match_type = "body (CCTV appearance)"

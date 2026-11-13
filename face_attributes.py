@@ -378,6 +378,9 @@ def predict_face_attributes(
             is_likely_non_face_object,
             is_likely_looking_down,
             is_likely_profile_view,
+            is_likely_animal_or_dog,
+            is_likely_unusable_face_plate,
+            capture_crop_passes_human_gate,
         )
 
         rear, _ = is_likely_rear_view(face_bgr)
@@ -388,6 +391,15 @@ def predict_face_attributes(
             return UNKNOWN_GENDER, None
         non_face, _ = is_likely_non_face_object(face_bgr)
         if non_face:
+            return UNKNOWN_GENDER, None
+        animal, _ = is_likely_animal_or_dog(face_bgr)
+        if animal:
+            return UNKNOWN_GENDER, None
+        mush, _ = is_likely_unusable_face_plate(face_bgr)
+        if mush:
+            return UNKNOWN_GENDER, None
+        human_ok, _ = capture_crop_passes_human_gate(face_bgr)
+        if not human_ok:
             return UNKNOWN_GENDER, None
         looking_down, _ = is_likely_looking_down(face_bgr)
         profile, _ = is_likely_profile_view(face_bgr)
@@ -417,8 +429,15 @@ def predict_face_attributes(
             return UNKNOWN_GENDER, None
         if profile and side < 110:
             return UNKNOWN_GENDER, None
+        # Tall body / hat / blurry plates must not count as Female.
+        if tall_body and conf < 0.95:
+            return UNKNOWN_GENDER, None
+        if side < 96:
+            return UNKNOWN_GENDER, None
     elif gender == "Male":
         if conf < float(CONFIDENCE_THRESHOLD):
+            return UNKNOWN_GENDER, None
+        if tall_body and conf < 0.85:
             return UNKNOWN_GENDER, None
     else:
         return UNKNOWN_GENDER, None

@@ -1,6 +1,7 @@
 /**
  * Real-time go2rtc WebRTC player (H.264 video, not JPEG frames).
- * Base: /go2rtc (nginx :8088) or http://127.0.0.1:1984
+ * Base: /go2rtc (nginx :8088 / Flask proxy) or http://127.0.0.1:1985
+ * Note: MSA_CCTV_100 owns :1984, MSA_CCTV owns :1985 — this project listens on :1986.
  */
 (function (global) {
   'use strict';
@@ -8,8 +9,10 @@
   function defaultBases() {
     const forced = (global.GO2RTC_BASE || (typeof localStorage !== 'undefined' && localStorage.getItem('go2rtcBase')) || '').trim();
     if (forced) return [forced.replace(/\/$/, '')];
-    // Prefer same-origin Flask proxy, then direct go2rtc.
-    return ['/go2rtc', 'http://127.0.0.1:1985', 'http://localhost:1985', 'http://127.0.0.1:1984', 'http://localhost:1984'];
+    const cfg = global.NVR_CCTV_CFG || {};
+    const port = Number(cfg.go2rtcPort) || 1986;
+    // Prefer same-origin Flask/nginx proxy, then this project's go2rtc.
+    return ['/go2rtc', `http://127.0.0.1:${port}`, `http://localhost:${port}`];
   }
 
   let _resolvedBase = null;

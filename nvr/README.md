@@ -5,7 +5,9 @@ Live Cameras **2×2 does not use 480×270 JPEG**. It uses **real WebRTC video** 
 | Port | Service |
 |------|---------|
 | 5000 | AI Tracker dashboard |
-| **1984** | **go2rtc** real-time WebRTC/MSE |
+| **1986** | **go2rtc** real-time WebRTC/MSE (this project) |
+| 1985 | MSA_CCTV go2rtc (do not steal) |
+| 1984 | MSA_CCTV_100 go2rtc (do not steal) |
 | **8088** | Nginx reverse proxy |
 | 18089+ | JPEG snapshots only (not live video) |
 
@@ -22,6 +24,6 @@ py -3.12 run_system.py --device cuda
 nvr\start_nvr.bat
 ```
 
-Open **http://127.0.0.1:8088** (or `:5000` if no nginx). Live Cameras status should read **GO2RTC · REALTIME**.
+Open **http://127.0.0.1:8088** (or `:5000` if no nginx). Live Cameras status should read **GO2RTC · WEBRTC**.
 
-If go2rtc is down, tiles show an offline hint — they will **not** fall back to low-res JPEG for live view.
+If go2rtc is down, tiles fall back to snapshot JPEG (`/go2rtc/api/frame.jpeg` or ports 18089+) — not the tracker disk JPG poll.

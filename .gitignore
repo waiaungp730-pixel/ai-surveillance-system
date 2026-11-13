@@ -11,6 +11,7 @@ venv/
 .env.*
 !.env.example
 .local_secrets.json
+announcement_settings.json
 cameras.json
 nvr/go2rtc.yaml
 nvr/nginx-snapshots.conf
@@ -27,10 +28,10 @@ nvr/nginx-snapshots.conf
 data/
 storage/
 captures/
+plate_captures/
 exports/*.csv
 uploads/
 live_preview/
-gfpgan/
 *.jpg
 *.jpeg
 *.png
@@ -42,7 +43,6 @@ gfpgan/
 *.pth
 *.onnx
 *.caffemodel
-models/
 
 # Sample / test media
 video/
@@ -52,21 +52,8 @@ video/
 # Docker local state and logs
 .docker/
 *.log
-*.log.err
-startup_stabilize.log*
-system_status.json
-
-# Local scratch / one-off scripts
-_tmp_*.py
 
 # NVR binaries / runtime
 nvr/go2rtc.exe
 nvr/logs/
 nvr/*.zip
-
-# IDE / OS
-.idea/
-.vscode/
-.cursor/
-Thumbs.db
-Desktop.ini

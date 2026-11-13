@@ -5,6 +5,7 @@ Database queries for the visitor tracking dashboard.
 import json
 import re
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -13,6 +14,7 @@ from captures import (
     CAPTURES_DIR,
     capture_display_is_body_crop,
     capture_display_is_full_frame,
+    capture_display_is_person_box,
     ensure_capture_column,
 )
 from face_attributes import ensure_attribute_columns
@@ -234,7 +236,7 @@ def _face_capture_file_ok(path_value: Optional[str]) -> bool:
         img = cv2.imread(str(p))
         if img is None:
             return True
-        if capture_display_is_full_frame():
+        if capture_display_is_full_frame() or capture_display_is_person_box():
             return True
         h, w = int(img.shape[0]), int(img.shape[1])
         body_crop = capture_display_is_body_crop()
@@ -554,13 +556,21 @@ def fetch_device_detection_logs(
 
 
 def fetch_live_face_events_as_logs(
-    conn: sqlite3.Connection, limit: int = 50
+    conn: sqlite3.Connection,
+    limit: int = 50,
+    *,
+    today_only: bool = False,
+    range_key: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Map recent tracking_logs face captures into the Live AI Infraction Logs shape.
 
     device_detection_events is only filled by smoking/device scans; live CCTV
     face captures live in tracking_logs — surface them so the dashboard panel works.
+
+    When ``today_only`` is True (and no ``range_key``), only rows from the current
+    calendar day are returned. Pass ``range_key`` ``today`` / ``7d`` / ``30d`` to
+    match the dashboard time-range filter.
     """
     ensure_capture_column(conn)
     ensure_attribute_columns(conn)
@@ -589,12 +599,24 @@ def fetch_live_face_events_as_logs(
 
     log_cols = {row[1] for row in conn.execute("PRAGMA table_info(tracking_logs)")}
     display_col = ", display_name" if "display_name" in log_cols else ""
+    key = (range_key or "").strip().lower()
+    if key in ("today", "7d", "30d", "week", "month"):
+        if key == "week":
+            key = "7d"
+        if key == "month":
+            key = "30d"
+        day_clause = f"AND {_dashboard_range_date_filter(key)}"
+    elif today_only:
+        day_clause = "AND date(timestamp) = date('now')"
+    else:
+        day_clause = ""
     rows = conn.execute(
         f"""
         SELECT id, person_id, known_person_id, camera_location, timestamp,
                capture_path, scene_path, gender, age{display_col}
         FROM tracking_logs
         WHERE capture_path IS NOT NULL AND TRIM(capture_path) != ''
+          {day_clause}
         ORDER BY timestamp DESC, id DESC
         LIMIT ?
         """,
@@ -1526,6 +1548,116 @@ def _ensure_overview_person_flags(conn: sqlite3.Connection) -> None:
         pass
 
 
+def _parse_log_timestamp(value: str) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _captures_look_identical(path_a: str, path_b: str) -> bool:
+    """True when two saved JPEG crops are the same picture (duplicate stranger spam)."""
+    if not path_a or not path_b:
+        return False
+    if path_a == path_b:
+        return True
+    try:
+        import cv2
+        import numpy as np
+
+        pa = CAPTURES_DIR / Path(str(path_a).replace("\\", "/")).name
+        pb = CAPTURES_DIR / Path(str(path_b).replace("\\", "/")).name
+        if not pa.is_file() or not pb.is_file():
+            return False
+        if pa.stat().st_size == pb.stat().st_size:
+            with pa.open("rb") as fa, pb.open("rb") as fb:
+                if fa.read(4096) == fb.read(4096):
+                    return True
+        ia = cv2.imread(str(pa))
+        ib = cv2.imread(str(pb))
+        if ia is None or ib is None or ia.size == 0 or ib.size == 0:
+            return False
+        sa = cv2.resize(ia, (48, 48), interpolation=cv2.INTER_AREA)
+        sb = cv2.resize(ib, (48, 48), interpolation=cv2.INTER_AREA)
+        return float(np.mean(cv2.absdiff(sa, sb))) < 4.0
+    except Exception:
+        return False
+
+
+def fetch_capture_encounter_cluster(
+    conn: sqlite3.Connection,
+    camera_location: str,
+    timestamp: str,
+    *,
+    window_sec: int = 60,
+    limit: int = 8,
+) -> List[Dict[str, Any]]:
+    """
+    Distinct people captured on one camera within a short window (same hallway pass).
+
+    Collapses duplicate stranger rows and visually identical crops so the review UI
+    shows one portrait per person met — not two copies of the same walker.
+    """
+    ensure_capture_column(conn)
+    ensure_attribute_columns(conn)
+    center = _parse_log_timestamp(timestamp)
+    if center is None:
+        return []
+    cam = str(camera_location or "").strip()
+    if not cam:
+        return []
+    window_sec = max(10, min(int(window_sec), 180))
+    limit = max(1, min(int(limit), 12))
+    start = (center - timedelta(seconds=window_sec)).strftime("%Y-%m-%dT%H:%M:%S")
+    end = (center + timedelta(seconds=window_sec)).strftime("%Y-%m-%dT%H:%M:%S")
+    log_cols = {row[1] for row in conn.execute("PRAGMA table_info(tracking_logs)")}
+    display_col = ", tl.display_name" if "display_name" in log_cols else ""
+    rows = conn.execute(
+        f"""
+        SELECT tl.id, tl.person_id, tl.known_person_id, tl.camera_location, tl.timestamp,
+               tl.capture_path, tl.scene_path, tl.gender, tl.age{display_col}
+        FROM tracking_logs tl
+        WHERE tl.camera_location = ?
+          AND tl.timestamp >= ?
+          AND tl.timestamp <= ?
+          AND tl.capture_path IS NOT NULL AND TRIM(tl.capture_path) != ''
+        ORDER BY tl.timestamp ASC, tl.id ASC
+        LIMIT ?
+        """,
+        (cam, start, end, max(limit * 4, 24)),
+    ).fetchall()
+    if not rows:
+        return []
+
+    picked: List[Any] = []
+    seen_paths: Set[str] = set()
+    for row in rows:
+        cap = str(row["capture_path"] or "").strip()
+        if not cap or cap in seen_paths:
+            continue
+        duplicate = False
+        for kept in picked:
+            kept_cap = str(kept["capture_path"] or "").strip()
+            if _captures_look_identical(cap, kept_cap):
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        seen_paths.add(cap)
+        picked.append(row)
+        if len(picked) >= limit:
+            break
+
+    return _capture_events_from_log_rows(
+        conn, picked, limit=limit, event_prefix="Encounter"
+    )
+
+
 def fetch_captures_by_overview_category(
     conn: sqlite3.Connection,
     category: str,
@@ -1738,6 +1870,78 @@ def count_captures_by_day(conn: sqlite3.Connection, day_iso: str) -> int:
           )
         """,
         (day,),
+    ).fetchone()
+    try:
+        return int(row["c"] if row and "c" in row.keys() else (row[0] if row else 0))
+    except Exception:
+        return 0
+
+
+def fetch_captures_by_window(
+    conn: sqlite3.Connection,
+    window: str,
+    *,
+    limit: int = 96,
+) -> List[Dict[str, Any]]:
+    """Captures for KPI cards: ``today`` or ``active`` (last 15 minutes)."""
+    ensure_capture_column(conn)
+    ensure_attribute_columns(conn)
+    try:
+        from identity import ensure_log_display_name_column
+
+        ensure_log_display_name_column(conn)
+    except Exception:
+        pass
+
+    key = str(window or "today").strip().lower()
+    limit = max(1, min(int(limit), 120))
+    log_cols = {row[1] for row in conn.execute("PRAGMA table_info(tracking_logs)")}
+    display_col = ", display_name" if "display_name" in log_cols else ""
+
+    if key in ("active", "active_now", "recent", "15m"):
+        where_sql = "datetime(timestamp) >= datetime('now', '-15 minutes')"
+        prefix = "active"
+        params: tuple = (max(limit * 3, 150),)
+    else:
+        where_sql = "date(timestamp) = date('now')"
+        prefix = "today"
+        params = (max(limit * 3, 150),)
+
+    rows = conn.execute(
+        f"""
+        SELECT id, person_id, known_person_id, camera_location, timestamp,
+               capture_path, scene_path, gender, age{display_col}
+        FROM tracking_logs
+        WHERE {where_sql}
+          AND (
+            (capture_path IS NOT NULL AND TRIM(capture_path) != '')
+            OR (scene_path IS NOT NULL AND TRIM(scene_path) != '')
+          )
+        ORDER BY timestamp DESC, id DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return _capture_events_from_log_rows(
+        conn, rows, limit=limit, event_prefix=prefix
+    )
+
+
+def count_captures_by_window(conn: sqlite3.Connection, window: str) -> int:
+    key = str(window or "today").strip().lower()
+    if key in ("active", "active_now", "recent", "15m"):
+        where_sql = "datetime(timestamp) >= datetime('now', '-15 minutes')"
+    else:
+        where_sql = "date(timestamp) = date('now')"
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS c FROM tracking_logs
+        WHERE {where_sql}
+          AND (
+            (capture_path IS NOT NULL AND TRIM(capture_path) != '')
+            OR (scene_path IS NOT NULL AND TRIM(scene_path) != '')
+          )
+        """
     ).fetchone()
     try:
         return int(row["c"] if row and "c" in row.keys() else (row[0] if row else 0))

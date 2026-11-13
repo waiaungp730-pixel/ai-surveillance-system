@@ -128,7 +128,13 @@ from yolo_loader import DEFAULT_MODEL, load_yolo_model, resolve_model_path as re
 
 PROJECT_DIR = Path(__file__).parent
 DB_PATH = PROJECT_DIR / "visitor_tracking.db"
-COOLDOWN_SECONDS = 3
+# Same track_id: minimum seconds between saves (was 3s — flooded sitting desks).
+COOLDOWN_SECONDS = max(30.0, float(os.environ.get("CAPTURE_COOLDOWN_SEC", "180")))
+# Same camera seat/cell after track ID changes (sitting strangers).
+STATIONARY_CAPTURE_COOLDOWN_SEC = max(
+    60.0, float(os.environ.get("STATIONARY_CAPTURE_COOLDOWN_SEC", "600"))
+)
+STATIONARY_GRID_PX = max(40, int(float(os.environ.get("STATIONARY_GRID_PX", "140"))))
 PERSON_CLASS_ID = 0
 MIN_MODEL_BYTES = 5_000_000
 MIN_PERSON_HEIGHT_PX = 36
@@ -248,9 +254,88 @@ TELEGRAM_ALERT_NON_WATCHLIST = _env_bool(
     "TELEGRAM_ALERT_NON_WATCHLIST",
     _env_bool("TELEGRAM_ALERT_STRANGERS", True),
 )
-TELEGRAM_ALERT_WATCHLIST = _env_bool("TELEGRAM_ALERT_WATCHLIST", True)
+TELEGRAM_ALERT_WATCHLIST = _env_bool("TELEGRAM_ALERT_WATCHLIST", False)
 # Named People (not watchlist): Telegram when CCTV matches enrolled photos.
-TELEGRAM_ALERT_NAMED = _env_bool("TELEGRAM_ALERT_NAMED", True)
+TELEGRAM_ALERT_NAMED = _env_bool("TELEGRAM_ALERT_NAMED", False)
+# Save captures only for strangers — skip Named People gallery matches.
+# Watchlist / blacklist hits still save (security).
+CAPTURE_STRANGERS_ONLY = _env_bool("CAPTURE_STRANGERS_ONLY", True)
+
+
+def _telegram_alert_non_watchlist() -> bool:
+    try:
+        from announcement_settings import telegram_alert_strangers_enabled
+
+        return telegram_alert_strangers_enabled()
+    except Exception:
+        return TELEGRAM_ALERT_NON_WATCHLIST
+
+
+def _telegram_alert_watchlist() -> bool:
+    try:
+        from announcement_settings import telegram_alert_watchlist_enabled
+
+        return telegram_alert_watchlist_enabled()
+    except Exception:
+        return TELEGRAM_ALERT_WATCHLIST
+
+
+def _telegram_alert_named() -> bool:
+    try:
+        from announcement_settings import telegram_alert_named_enabled
+
+        return telegram_alert_named_enabled()
+    except Exception:
+        return TELEGRAM_ALERT_NAMED
+
+
+def _should_skip_named_capture(
+    conn: sqlite3.Connection,
+    *,
+    is_stranger: bool,
+    known_id: Optional[int],
+    person_label: Optional[str],
+    camera_location: str = "",
+) -> bool:
+    """
+    True when CAPTURE_STRANGERS_ONLY and this hit is a Named Person.
+
+    Watchlist / blacklist enrollments still capture even when labeled.
+    """
+    if not CAPTURE_STRANGERS_ONLY:
+        return False
+    if is_stranger:
+        return False
+    try:
+        from identity import (
+            is_enrolled_blacklist_person,
+            is_enrolled_watchlist_person,
+            is_named_person,
+        )
+
+        kid = int(known_id) if known_id is not None else None
+        if kid is not None:
+            if is_enrolled_watchlist_person(conn, kid) or is_enrolled_blacklist_person(
+                conn, kid
+            ):
+                return False
+            if is_named_person(conn, kid):
+                print(
+                    f"[CAPTURE] skip named person "
+                    f"{person_label or kid} @ cam {camera_location}"
+                )
+                return True
+    except Exception:
+        pass
+    label = str(person_label or "").strip()
+    if label and label.lower() not in ("stranger", "unknown", ""):
+        print(
+            f"[CAPTURE] skip named person {label} @ cam {camera_location}"
+        )
+        return True
+    return False
+
+
 TELEGRAM_NON_WATCHLIST_COOLDOWN_SEC = max(
     3.0,
     _env_float(
@@ -282,6 +367,8 @@ CATCH_EVERY_PERSON = _env_bool("CATCH_EVERY_PERSON", True)
 CATCH_BACKS = _env_bool("CATCH_BACKS", False)
 # Faces only: never save a YOLO person plate without a usable face (no back/body alerts).
 FACE_ONLY_CATCH = _env_bool("FACE_ONLY_CATCH", True)
+# Allow high-angle looking-down person plates when face detector finds none.
+CATCH_LOOKING_DOWN = _env_bool("CATCH_LOOKING_DOWN", False)
 # Person-catch / Telegram must be at least this large (px). Tiny mush still
 # looks "Clear" to Laplacian because of pixel noise.
 PERSON_CATCH_MIN_SIDE = int(_env_float("PERSON_CATCH_MIN_SIDE", "72"))
@@ -967,7 +1054,9 @@ class CameraReader(threading.Thread):
 
     def _open_backoff_sec(self) -> float:
         """Exponential backoff while the stream stays unreachable."""
-        return min(30.0, 2.0 * (2 ** min(self._open_failures, 4)))
+        # Cap low — offline cams already fail the TCP probe in ~1s; don't
+        # wait half a minute between retries (log spam + delayed recovery).
+        return min(10.0, 1.5 * (2 ** min(self._open_failures, 3)))
 
     def _release_capture(self) -> None:
         if self.cap is not None:
@@ -2506,11 +2595,13 @@ def _face_crop_displayable(
     min_side: Optional[int] = None,
     min_sharpness: Optional[float] = None,
     min_skin_fraction: Optional[float] = None,
+    ignore_non_face_object: bool = False,
 ) -> bool:
     """
     True when a face square is large/sharp enough to show on Telegram / captures.
 
     Rejects tiny distant head patches that only look like noise after upscaling.
+    Set ``ignore_non_face_object`` for full-body person plates (clothing FP).
     """
     if face_bgr is None or getattr(face_bgr, "size", 0) == 0:
         return False
@@ -2533,22 +2624,23 @@ def _face_crop_displayable(
         )
         if not _face_crop_has_skin(arr, min_fraction=skin_min):
             return False
-        try:
-            from face_print_filter import is_likely_non_face_object
+        if not ignore_non_face_object:
+            try:
+                from face_print_filter import is_likely_non_face_object
 
-            bad_obj, _ = is_likely_non_face_object(arr)
-            if bad_obj:
-                return False
-        except Exception:
-            pass
-        try:
-            from face_print_filter import is_likely_streaked_or_corrupt_capture
+                bad_obj, _ = is_likely_non_face_object(arr)
+                if bad_obj:
+                    return False
+            except Exception:
+                pass
+            try:
+                from face_print_filter import is_likely_streaked_or_corrupt_capture
 
-            streak, _ = is_likely_streaked_or_corrupt_capture(arr)
-            if streak:
-                return False
-        except Exception:
-            pass
+                streak, _ = is_likely_streaked_or_corrupt_capture(arr)
+                if streak:
+                    return False
+            except Exception:
+                pass
         gate = (
             float(min_sharpness)
             if min_sharpness is not None
@@ -2584,11 +2676,30 @@ def _predict_capture_attributes(
             return
         if getattr(arr, "size", 0) <= 0:
             return
+        # Never let junk / rear / animal plates vote on gender.
+        try:
+            from face_print_filter import (
+                capture_crop_passes_human_gate,
+                is_likely_rear_view,
+                is_likely_animal_or_dog,
+            )
+
+            rear, _ = is_likely_rear_view(arr)
+            if rear:
+                return
+            animal, _ = is_likely_animal_or_dog(arr)
+            if animal:
+                return
+            ok, _ = capture_crop_passes_human_gate(arr)
+            if not ok:
+                return
+        except Exception:
+            pass
         candidates.append(arr)
 
     # 1) Tight face first when available.
     _push(aligned_face)
-    # 2) Head band from tall body plates (top ~42%).
+    # 2) Head band from tall body plates (top ~42%) — not full torso.
     if display_crop is not None:
         try:
             body = np.ascontiguousarray(display_crop)
@@ -2596,9 +2707,12 @@ def _predict_capture_attributes(
             if bh >= int(bw * 1.15) and bh >= 48:
                 head = body[0 : max(1, int(round(bh * 0.42)))]
                 _push(head)
-            _push(body)
+            # Full body only if we still have no usable face/head candidate.
+            if not candidates:
+                _push(body)
         except Exception:
-            _push(display_crop)
+            if not candidates:
+                _push(display_crop)
 
     if not candidates:
         return "Unknown", None
@@ -2970,6 +3084,58 @@ def _visit_key(
     )
 
 
+def _stationary_seat_key(
+    camera_location: str,
+    bbox: Optional[Sequence[float]],
+    *,
+    grid: Optional[int] = None,
+) -> Optional[Tuple[str, object]]:
+    """Coarse camera+position key so sitting people keep one cooldown across re-tracks."""
+    if bbox is None:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(v) for v in list(bbox)[:4])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if x2 <= x1 or y2 <= y1:
+        return None
+    cell = int(grid if grid is not None else STATIONARY_GRID_PX)
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    return (str(camera_location), "seat", int(cx / cell), int(cy / cell))
+
+
+def _stationary_recapture_blocked(
+    last_logged: Dict[Tuple[str, object], float],
+    camera_location: str,
+    bbox: Optional[Sequence[float]],
+    now: float,
+) -> bool:
+    """True when this desk/seat was already captured recently."""
+    seat = _stationary_seat_key(camera_location, bbox)
+    if seat is None:
+        return False
+    elapsed = now - float(last_logged.get(seat, 0.0))
+    if elapsed < STATIONARY_CAPTURE_COOLDOWN_SEC:
+        print(
+            f"[FACE] skip stationary re-capture @ cam {camera_location} "
+            f"({elapsed:.0f}s < {STATIONARY_CAPTURE_COOLDOWN_SEC:.0f}s seat cooldown)"
+        )
+        return True
+    return False
+
+
+def _mark_stationary_captured(
+    last_logged: Dict[Tuple[str, object], float],
+    camera_location: str,
+    bbox: Optional[Sequence[float]],
+    now: float,
+) -> None:
+    seat = _stationary_seat_key(camera_location, bbox)
+    if seat is not None:
+        last_logged[seat] = now
+
+
 def _face_grid_visit_key(
     camera_location: str,
     bbox: Sequence[float],
@@ -3140,15 +3306,33 @@ def _process_standalone_face_watchlist(
         ):
             continue
         try:
-            from face_print_filter import is_likely_invalid_face_crop
+            from face_print_filter import is_likely_invalid_face_crop, is_likely_rear_view
 
             bad_crop, _reason = is_likely_invalid_face_crop(aligned_face)
             if bad_crop:
+                continue
+            rear_grid, _ = is_likely_rear_view(aligned_face)
+            if rear_grid and not CATCH_BACKS:
                 continue
         except Exception:
             pass
 
         face_area = float(aligned_face.shape[0] * aligned_face.shape[1])
+        person_bbox: Optional[List[float]] = None
+        if person_bboxes:
+            for pb in person_bboxes:
+                try:
+                    px1, py1, px2, py2 = (
+                        float(v) for v in np.asarray(pb, dtype=np.float32).reshape(-1)[:4]
+                    )
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if _face_in_person_bbox(
+                    (int(x1), int(y1), int(x2), int(y2)),
+                    np.asarray([px1, py1, px2, py2], dtype=np.float32),
+                ):
+                    person_bbox = [px1, py1, px2, py2]
+                    break
         if _commit_face_candidate(
             conn,
             camera_location,
@@ -3164,6 +3348,7 @@ def _process_standalone_face_watchlist(
             now,
             bbox=[float(v) for v in bbox_xyxy],
             frame_bgr=source_np,
+            person_bbox=person_bbox,
             telegram_batch=batch,
         ):
             log_count += 1
@@ -3206,6 +3391,57 @@ def _run_watchlist_face_pass(
     )
 
 
+_CAPTURE_SCHEDULE_LOG_AT: Dict[str, float] = {}
+
+
+def _capture_schedule_allows(camera_location: str) -> bool:
+    """Gate live camera saves when outside the dashboard capture window."""
+    try:
+        from announcement_settings import captures_allowed_now
+
+        if captures_allowed_now():
+            return True
+    except Exception:
+        return True
+    now_ts = time.time()
+    key = str(camera_location or "cam")
+    last = _CAPTURE_SCHEDULE_LOG_AT.get(key, 0.0)
+    if now_ts - last >= 120.0:
+        _CAPTURE_SCHEDULE_LOG_AT[key] = now_ts
+        print(
+            f"[CAPTURE] schedule pause @ cam {camera_location} — outside capture window"
+        )
+    return False
+
+
+def _allow_looking_down_rear(reason: str) -> bool:
+    """High-angle hallway looking-down faces only — never rear/back classifications."""
+    if not CATCH_LOOKING_DOWN:
+        return False
+    text = str(reason or "").lower()
+    # rear_view_looking_down / rear_view_side_turned / walking_away must stay blocked.
+    if text.startswith("rear_view") or "rear_view_" in text:
+        return False
+    if any(
+        token in text
+        for token in (
+            "walking_away",
+            "shirt_back",
+            "side_turned",
+            "shoulder_floor",
+            "nape",
+            "crown_neck",
+            "ears_neck",
+            "both_ears",
+            "hand_crown",
+            "no_face",
+        )
+    ):
+        return False
+    # Soft keep only for dedicated looking-down face reasons (not backs).
+    return text.startswith("looking_down") or text == "looking_down"
+
+
 def _should_person_catch(camera_location: str) -> bool:
     return bool(CATCH_EVERY_PERSON) or is_outdoor_gate_camera(camera_location)
 
@@ -3233,12 +3469,20 @@ def _allow_pose_person_fallback(reason: str) -> bool:
             "walking_away",
             "nape",
             "crown_neck",
+            "crown_hair",
             "ears_neck",
+            "both_ears",
+            "two_ears",
             "neck_only",
             "dull_hair",
             "no_face_bright",
             "no_face(",
             "hand_crown",
+            "shoulder_floor",
+            "shirt_back",
+            "looking_down",
+            "both_ears",
+            "two_ears",
         )
     )
     if is_rear and not CATCH_BACKS:
@@ -3261,13 +3505,17 @@ def _person_plate_ok_for_catch(
     except Exception:
         return False
     # Tiny hallway blobs (~50px) are not usable — always reject.
-    min_side_req = max(48, int(PERSON_CATCH_MIN_SIDE))
+    min_side_req = max(40, int(PERSON_CATCH_MIN_SIDE))
     if min(h, w) < min_side_req:
         print(
             f"[FACE] skip tiny plate @ cam {camera_location}: "
             f"{w}x{h} < {min_side_req}px"
         )
         return False
+    # YOLO person boxes (clothing, little skin) — face-crop heuristics FP hard.
+    aspect = h / float(max(1, w))
+    person_like = (0.55 <= aspect <= 2.6) and max(h, w) >= 100
+    tall_person = aspect >= 1.12
     try:
         from face_print_filter import (
             is_junk_person_plate_reason,
@@ -3281,8 +3529,15 @@ def _person_plate_ok_for_catch(
         if not CATCH_BACKS:
             rear, rear_reason = is_likely_rear_view(arr)
             if rear:
-                print(f"[FACE] skip back @ cam {camera_location}: {rear_reason}")
-                return False
+                # Never soft-keep rear_view_* as "looking down".
+                if _allow_looking_down_rear(rear_reason) and person_like:
+                    print(
+                        f"[FACE] keep looking-down person @ cam {camera_location}: "
+                        f"{rear_reason}"
+                    )
+                else:
+                    print(f"[FACE] skip back @ cam {camera_location}: {rear_reason}")
+                    return False
         mush, mush_reason = is_likely_unusable_face_plate(arr)
         if mush:
             print(f"[FACE] skip unusable @ cam {camera_location}: {mush_reason}")
@@ -3293,8 +3548,21 @@ def _person_plate_ok_for_catch(
             return False
         bad_obj, obj_reason = is_likely_non_face_object(arr)
         if bad_obj and is_junk_person_plate_reason(obj_reason):
-            print(f"[FACE] skip non-person @ cam {camera_location}: {obj_reason}")
-            return False
+            obj_l = str(obj_reason or "").lower()
+            # Patterned clothes / bags trip bicycle_wheel + torso_strap on hall cams.
+            soft_fp = any(
+                tok in obj_l
+                for tok in (
+                    "bicycle_wheel",
+                    "bicycle_wheel_hub",
+                    "metal_spokes",
+                    "torso_strap",
+                    "shoulder_torso",
+                )
+            )
+            if not (CATCH_EVERY_PERSON and person_like and soft_fp):
+                print(f"[FACE] skip non-person @ cam {camera_location}: {obj_reason}")
+                return False
         # Tall/narrow YOLO person boxes look like "narrow_strip" to the face-crop
         # streak heuristic — keep them when catching every person.
         if not CATCH_EVERY_PERSON:
@@ -3318,20 +3586,92 @@ def _person_plate_ok_for_catch(
                 return False
     except Exception:
         pass
-    # Always require a minimally displayable plate (CATCH_EVERY_PERSON used to
-    # bypass this and flooded Telegram with 50px mush).
-    if not _face_crop_has_skin(display_crop, min_fraction=0.05):
+    # Full-body plates are mostly clothing — tiny skin is normal.
+    skin_min = 0.02 if (CATCH_EVERY_PERSON and person_like) else 0.05
+    if not _face_crop_has_skin(display_crop, min_fraction=skin_min):
         print(f"[FACE] skip no-skin plate @ cam {camera_location}")
         return False
     if not _face_crop_displayable(
         display_crop,
         min_side=min_side_req,
         min_sharpness=max(1.0, gate_min_face_laplacian(camera_location) * 0.25),
-        min_skin_fraction=0.05,
+        min_skin_fraction=skin_min,
+        ignore_non_face_object=bool(CATCH_EVERY_PERSON and person_like),
     ):
         print(f"[FACE] skip undisplayable gate plate @ cam {camera_location}")
         return False
     return True
+
+
+def _commit_assigned_faces_same_frame(
+    conn: sqlite3.Connection,
+    camera_location: str,
+    source_np: np.ndarray,
+    eligible_indices: List[int],
+    eligible_bboxes: List[np.ndarray],
+    face_by_person_idx: Dict[int, object],
+    track_ids_t,
+    last_logged: Dict[Tuple[str, object], float],
+    track_to_known: Dict[str, Dict[int, int]],
+    shared_gallery: Optional[SharedFaceGallery],
+    cooldown: float,
+    now: float,
+    *,
+    telegram_batch: Optional[List[dict]] = None,
+) -> int:
+    """
+    Commit every 1:1 face→person assignment when multiple walkers share a frame.
+
+    Gate / hallway pairs often miss the second person when only the best-track
+    selector fires once per trajectory.
+    """
+    if len(eligible_bboxes) < 2 or not face_by_person_idx:
+        return 0
+    if not _capture_schedule_allows(camera_location):
+        return 0
+    if not is_outdoor_gate_camera(camera_location) and not CATCH_EVERY_PERSON:
+        return 0
+    log_count = 0
+    for pi, det in face_by_person_idx.items():
+        try:
+            pb = eligible_bboxes[pi]
+            track_id = None
+            if track_ids_t is not None:
+                orig_i = eligible_indices[pi]
+                track_id = int(track_ids_t[orig_i].item())
+            key = _visit_key(camera_location, track_id, pb)
+            if now - last_logged.get(key, 0.0) < cooldown:
+                continue
+            feature = getattr(det, "embedding", None)
+            bbox = getattr(det, "bbox", None)
+            if feature is None or bbox is None:
+                continue
+            aligned = crop_face_from_frame(source_np, bbox)
+            if aligned is None or getattr(aligned, "size", 0) == 0:
+                continue
+            face_area = float(aligned.shape[0] * aligned.shape[1])
+            if _commit_face_candidate(
+                conn,
+                camera_location,
+                track_id,
+                key,
+                np.asarray(feature, dtype=np.float32).reshape(-1),
+                aligned,
+                face_area,
+                last_logged,
+                track_to_known,
+                shared_gallery,
+                cooldown,
+                now,
+                bbox=[float(v) for v in bbox[:4]],
+                frame_bgr=source_np,
+                person_bbox=[float(v) for v in np.asarray(pb).reshape(-1)[:4]],
+                telegram_batch=telegram_batch,
+            ):
+                log_count += 1
+        except Exception as exc:
+            print(f"[WARN] same-frame multi-catch @ cam {camera_location}: {exc}")
+    return log_count
 
 
 def _fallback_person_plate(
@@ -3392,10 +3732,16 @@ def _commit_face_candidate(
     telegram_batch: Optional[List[dict]] = None,
 ) -> bool:
     """Run gallery matching and persist one finalized face sighting."""
+    if not _capture_schedule_allows(camera_location):
+        return False
     if now - last_logged.get(visit_key, 0.0) < cooldown:
         return False
+    plate_bbox_early = person_bbox if person_bbox is not None else bbox
+    if _stationary_recapture_blocked(last_logged, camera_location, plate_bbox_early, now):
+        last_logged[visit_key] = now
+        return False
     outdoor = is_outdoor_gate_camera(camera_location)
-    plate_bbox = person_bbox if person_bbox is not None else bbox
+    plate_bbox = plate_bbox_early
     skin_min = (
         gate_skin_min_fraction(camera_location)
         if outdoor
@@ -3448,15 +3794,32 @@ def _commit_face_candidate(
             return False
         rear, rear_reason = is_likely_rear_view(aligned_face)
         if rear:
-            print(f"[FACE] reject back-of-head @ cam {camera_location}: {rear_reason}")
-            if CATCH_BACKS:
-                return _person_fallback(rear_reason)
-            return False
+            if _allow_looking_down_rear(rear_reason):
+                print(
+                    f"[FACE] keep looking-down face @ cam {camera_location}: "
+                    f"{rear_reason}"
+                )
+            else:
+                print(f"[FACE] reject back-of-head @ cam {camera_location}: {rear_reason}")
+                if CATCH_BACKS:
+                    return _person_fallback(rear_reason)
+                return False
     except Exception:
         pass
     if _reject_wall_print_face(frame_bgr, bbox):
         return False
     if person_bbox is not None and bbox is not None:
+        try:
+            from face_print_filter import person_bbox_suggests_quadruped
+
+            quad, quad_why = person_bbox_suggests_quadruped(person_bbox, bbox)
+            if quad:
+                print(
+                    f"[FACE] reject non-human @ cam {camera_location}: {quad_why}"
+                )
+                return False
+        except Exception:
+            pass
         try:
             if not _face_passes_person_head_gate(
                 bbox,
@@ -3478,7 +3841,7 @@ def _commit_face_candidate(
         from face_print_filter import is_likely_rear_view
 
         rear_early, rear_early_reason = is_likely_rear_view(display_crop)
-        if rear_early:
+        if rear_early and not _allow_looking_down_rear(rear_early_reason):
             print(
                 f"[FACE] reject walking-away crop @ cam {camera_location}: "
                 f"{rear_early_reason}"
@@ -3486,6 +3849,11 @@ def _commit_face_candidate(
             if CATCH_BACKS:
                 return _person_fallback(rear_early_reason)
             return False
+        if rear_early:
+            print(
+                f"[FACE] keep looking-down crop @ cam {camera_location}: "
+                f"{rear_early_reason}"
+            )
     except Exception:
         pass
     if capture_display_is_body_crop():
@@ -3510,6 +3878,7 @@ def _commit_face_candidate(
             pass
     try:
         from face_print_filter import (
+            is_likely_animal_or_dog,
             is_likely_non_face_object,
             is_likely_rear_view,
             is_likely_streaked_or_corrupt_capture,
@@ -3520,6 +3889,17 @@ def _commit_face_candidate(
         wood, wood_reason = is_likely_wood_post_or_rail(display_crop)
         if wood:
             print(f"[FACE] reject wood/rail display @ cam {camera_location}: {wood_reason}")
+            return False
+        animal, animal_reason = is_likely_animal_or_dog(display_crop)
+        if animal:
+            print(f"[FACE] reject animal @ cam {camera_location}: {animal_reason}")
+            return False
+        invalid_disp, invalid_disp_reason = is_likely_invalid_face_crop(display_crop)
+        if invalid_disp:
+            print(
+                f"[FACE] reject non-human display @ cam {camera_location}: "
+                f"{invalid_disp_reason}"
+            )
             return False
         mush, mush_reason = is_likely_unusable_face_plate(display_crop)
         if mush:
@@ -3532,11 +3912,16 @@ def _commit_face_candidate(
                 return _person_fallback(obj_reason)
             return False
         rear, rear_reason = is_likely_rear_view(display_crop)
-        if rear:
+        if rear and not _allow_looking_down_rear(rear_reason):
             print(f"[FACE] reject walking-away crop @ cam {camera_location}: {rear_reason}")
             if CATCH_BACKS:
                 return _person_fallback(rear_reason)
             return False
+        if rear:
+            print(
+                f"[FACE] keep looking-down display @ cam {camera_location}: "
+                f"{rear_reason}"
+            )
         streak, streak_reason = is_likely_streaked_or_corrupt_capture(display_crop)
         if streak:
             print(
@@ -3544,6 +3929,58 @@ def _commit_face_candidate(
                 f"{streak_reason}"
             )
             return False
+    except Exception:
+        pass
+
+    # Final human/face gate — blocks backs that slip skin heuristics (ear/nape)
+    # and decor/knob false positives from reaching the gallery.
+    try:
+        from face_print_filter import (
+            capture_crop_passes_human_gate,
+            is_likely_rear_view as _rear_check,
+        )
+
+        rear_disp, rear_disp_why = _rear_check(display_crop)
+        if rear_disp and not CATCH_BACKS:
+            print(
+                f"[FACE] reject back save @ cam {camera_location}: {rear_disp_why}"
+            )
+            return False
+        ok_disp, why_disp = capture_crop_passes_human_gate(display_crop)
+        if not ok_disp:
+            why_l = str(why_disp or "").lower()
+            # Never swap in aligned_face when the display plate is clearly a back.
+            back_markers = (
+                "crown",
+                "back_of_head",
+                "rear_view",
+                "nape",
+                "hair",
+                "top_of_head",
+                "neck_only",
+                "ears",
+                "both_ears",
+                "two_ears",
+            )
+            if (not CATCH_BACKS) and any(m in why_l for m in back_markers):
+                print(
+                    f"[FACE] reject back display @ cam {camera_location}: {why_disp}"
+                )
+                return False
+            rear_af, rear_af_why = _rear_check(aligned_face)
+            if rear_af and not CATCH_BACKS:
+                print(
+                    f"[FACE] reject back aligned @ cam {camera_location}: {rear_af_why}"
+                )
+                return False
+            ok_aligned, why_aligned = capture_crop_passes_human_gate(aligned_face)
+            if not ok_aligned:
+                print(
+                    f"[FACE] reject non-human save @ cam {camera_location}: "
+                    f"{why_disp or why_aligned}"
+                )
+                return False
+            display_crop = np.ascontiguousarray(aligned_face)
     except Exception:
         pass
 
@@ -3601,7 +4038,11 @@ def _commit_face_candidate(
         else abs(hash(visit_key)) % 900_000 + 100_000
     )
 
-    matched_id, match_distance = find_best_face_match(feature, conn)
+    matched_id, match_distance = find_best_face_match(
+        feature, conn, camera_location=camera_location
+    )
+    gallery_matched_id = matched_id
+    gallery_match_distance = match_distance
     alert_name = None
     if matched_id is not None:
         try:
@@ -3622,34 +4063,53 @@ def _commit_face_candidate(
         camera_name=f"CAM-{camera_location}",
     )
 
-    # Explicit CCTV watchlist alert for enrolled names (in case tier path is skipped).
+    # Explicit CCTV alerts for enrolled Watchlist / Blacklist people.
     try:
-        from identity import is_enrolled_watchlist_person
+        from identity import (
+            is_enrolled_blacklist_person,
+            is_enrolled_watchlist_person,
+        )
         from live_detection_hub import publish_person_alert
         from orion_frame_pipeline import IdentityTierRouter, MatchTier
 
-        if matched_id is not None and is_enrolled_watchlist_person(conn, matched_id):
-            decision = IdentityTierRouter.evaluate(matched_id, match_distance)
-            if decision.tier == MatchTier.BLACKLIST_ALERT:
-                conf = float(decision.match_percent or 0)
-                if conf <= 0 and match_distance < 900:
-                    conf = float(confidence_score_from_distance(match_distance))
+        list_id = None
+        alert_type = None
+        if matched_id is not None and is_enrolled_blacklist_person(conn, matched_id):
+            list_id = int(matched_id)
+            alert_type = "blacklist"
+        elif matched_id is not None and is_enrolled_watchlist_person(conn, matched_id):
+            list_id = int(matched_id)
+            alert_type = "watchlist"
+        if list_id is not None:
+            decision = IdentityTierRouter.evaluate(list_id, match_distance)
+            conf = float(decision.match_percent or 0)
+            if conf <= 0 and match_distance < 900:
+                conf = float(confidence_score_from_distance(match_distance))
+            # Fire when the match clears the alert tier (same gate for both lists).
+            if decision.tier in (
+                MatchTier.BLACKLIST_ALERT,
+                getattr(MatchTier, "POI_ALERT", MatchTier.BLACKLIST_ALERT),
+            ) or conf >= 1.0:
                 publish_person_alert(
                     camera=str(camera_location),
-                    name=str(alert_name or f"Person #{matched_id}"),
+                    name=str(alert_name or f"Person #{list_id}"),
                     confidence=max(1.0, conf),
                     face_bgr=display_crop,
-                    person_id=int(matched_id),
-                    known_person_id=int(matched_id),
+                    person_id=int(list_id),
+                    known_person_id=int(list_id),
                     bbox=bbox,
-                    alert_type="blacklist",
+                    alert_type=alert_type,
                     force=True,
                 )
     except Exception:
         pass
 
     known_id = resolve_known_person_from_face(
-        conn, feature, known_maps, db_track_id
+        conn,
+        feature,
+        known_maps,
+        db_track_id,
+        camera_location=camera_location,
     )
     if known_id is not None:
         upsert_best_face_profile(
@@ -3663,7 +4123,9 @@ def _commit_face_candidate(
     is_stranger = True
     try:
         from identity import (
+            NAMED_TRACK_MEMORY_MAX_DIST,
             capture_identity_label,
+            is_auto_identity_name,
             is_confident_named_match,
             is_named_person,
             resolve_live_capture_identity,
@@ -3680,14 +4142,43 @@ def _commit_face_candidate(
             )
         )
         if is_stranger:
-            # Soft / looking-down crops must not keep a prior Named sticky ID.
+            # Soft / looking-down crops used to wipe the Named ID and mint a
+            # new stranger on the next catch. Keep the assigned gallery ID when
+            # face match still points at the same labeled person.
+            keep_assigned = False
             if known_id is not None and is_named_person(conn, int(known_id)):
+                try:
+                    keep_assigned = (
+                        gallery_matched_id is not None
+                        and int(gallery_matched_id) == int(known_id)
+                        and np.isfinite(float(gallery_match_distance))
+                        and float(gallery_match_distance)
+                        <= float(NAMED_TRACK_MEMORY_MAX_DIST)
+                    )
+                except Exception:
+                    keep_assigned = False
+            if keep_assigned:
+                try:
+                    kept_name = resolve_known_person_name(conn, int(known_id))
+                except Exception:
+                    kept_name = None
+                if kept_name and not is_auto_identity_name(kept_name):
+                    is_stranger = False
+                    person_label = kept_name
+                    display_name = kept_name
+                else:
+                    person_label = None
+                if track_id is not None:
+                    known_maps[int(track_id)] = int(known_id)
+            elif known_id is not None and is_named_person(conn, int(known_id)):
                 if track_id is not None and known_maps.get(int(track_id)) == int(
                     known_id
                 ):
                     known_maps.pop(int(track_id), None)
                 known_id = None
-            person_label = None
+                person_label = None
+            else:
+                person_label = None
         elif matched_named_id is not None:
             matched_id = matched_named_id
             # Bind this CCTV catch to the Named People record so the enrolled
@@ -3730,6 +4221,17 @@ def _commit_face_candidate(
         person_label = None
         is_stranger = True
         display_name = "Stranger"
+
+    if _should_skip_named_capture(
+        conn,
+        is_stranger=bool(is_stranger),
+        known_id=known_id,
+        person_label=person_label or display_name,
+        camera_location=camera_location,
+    ):
+        last_logged[visit_key] = now
+        return False
+
     capture_file = save_face_capture(
         display_crop,
         known_id,
@@ -3765,29 +4267,50 @@ def _commit_face_candidate(
         display_name=person_label,
     )
     last_logged[visit_key] = now
+    _mark_stationary_captured(last_logged, camera_location, plate_bbox, now)
     _FACE_DETECT_COUNTS[camera_location] = (
         _FACE_DETECT_COUNTS.get(camera_location, 0) + 1
     )
     write_faces_detected(camera_location, _FACE_DETECT_COUNTS[camera_location])
 
-    # Telegram: non-watchlist CCTV incidents (and optionally enrolled watchlist).
+    # Telegram: strangers, named, watchlist, and blacklist (separate lists).
     try:
-        from identity import is_enrolled_watchlist_person
+        from identity import (
+            is_enrolled_blacklist_person,
+            is_enrolled_watchlist_person,
+        )
 
+        on_blacklist = (
+            known_id is not None and is_enrolled_blacklist_person(conn, int(known_id))
+        ) or (
+            matched_id is not None and is_enrolled_blacklist_person(conn, int(matched_id))
+        )
         on_watchlist = (
             known_id is not None and is_enrolled_watchlist_person(conn, int(known_id))
         ) or (
             matched_id is not None and is_enrolled_watchlist_person(conn, int(matched_id))
         )
-        named_hit = bool(person_label and not is_stranger and not on_watchlist)
-        named_tg = bool(TELEGRAM_ALERT_NAMED and named_hit)
-        watchlist_tg = TELEGRAM_ALERT_WATCHLIST and on_watchlist
-        non_watchlist_tg = (
-            TELEGRAM_ALERT_NON_WATCHLIST and not on_watchlist and not named_hit
+        named_hit = bool(
+            person_label and not is_stranger and not on_watchlist and not on_blacklist
         )
-        is_incident = bool(non_watchlist_tg and not watchlist_tg and not named_hit)
+        named_tg = bool(_telegram_alert_named() and named_hit)
+        watchlist_tg = _telegram_alert_watchlist() and on_watchlist
+        # Blacklist uses the watchlist Telegram toggle for now (same chat),
+        # but keeps a distinct alert_kind for UI / future settings.
+        blacklist_tg = _telegram_alert_watchlist() and on_blacklist
+        non_watchlist_tg = (
+            _telegram_alert_non_watchlist()
+            and not on_watchlist
+            and not on_blacklist
+            and not named_hit
+        )
+        is_incident = bool(
+            non_watchlist_tg and not watchlist_tg and not blacklist_tg and not named_hit
+        )
         tg_min_side = (
-            TELEGRAM_FACE_MIN_SIDE if (non_watchlist_tg or named_tg) else LIVE_FACE_DISPLAY_MIN_SIDE
+            TELEGRAM_FACE_MIN_SIDE
+            if (non_watchlist_tg or named_tg or blacklist_tg)
+            else LIVE_FACE_DISPLAY_MIN_SIDE
         )
         # Distant hallway faces are often 56–70px — do not force PERSON_CATCH_MIN_SIDE.
         tg_min_side = max(48, int(tg_min_side))
@@ -3803,21 +4326,48 @@ def _commit_face_candidate(
             ) or _face_crop_displayable(
                 aligned_face, min_side=tg_min_side, min_skin_fraction=tg_skin
             )
-        elif watchlist_tg or non_watchlist_tg:
+        elif watchlist_tg or blacklist_tg or non_watchlist_tg:
             tg_eligible = _face_crop_displayable(
                 aligned_face, min_side=tg_min_side, min_skin_fraction=tg_skin
             ) or _face_crop_displayable(
                 display_crop, min_side=tg_min_side, min_skin_fraction=tg_skin
             )
+        # Do not Telegram tiny postage-stamp crops (side>=20 used to bypass the
+        # displayable gate and produced letterboxed forehead squares).
         if CATCH_EVERY_PERSON and not tg_eligible and capture_file and (
-            is_incident or named_tg or non_watchlist_tg
+            is_incident or named_tg or non_watchlist_tg or blacklist_tg or watchlist_tg
         ):
             try:
-                side = int(min(display_crop.shape[0], display_crop.shape[1]))
+                from face_print_filter import capture_crop_passes_human_gate
+
+                human_ok, _ = capture_crop_passes_human_gate(display_crop)
+                human_face_ok, _ = capture_crop_passes_human_gate(aligned_face)
+                if human_ok or human_face_ok:
+                    side = int(min(display_crop.shape[0], display_crop.shape[1]))
+                    portrait = (
+                        int(display_crop.shape[0]) / float(max(1, int(display_crop.shape[1])))
+                        >= 1.18
+                    )
+                    if portrait and side >= max(96, int(tg_min_side)):
+                        tg_eligible = True
+                    elif side >= max(140, int(tg_min_side) * 2):
+                        tg_eligible = True
             except Exception:
-                side = 0
-            if side >= 20:
-                tg_eligible = True
+                pass
+        if tg_eligible:
+            try:
+                from face_print_filter import capture_crop_passes_human_gate
+
+                ok_disp, why_disp = capture_crop_passes_human_gate(display_crop)
+                ok_aligned, why_aligned = capture_crop_passes_human_gate(aligned_face)
+                if not ok_disp and not ok_aligned:
+                    tg_eligible = False
+                    print(
+                        f"[FACE] skip Telegram non-human @ cam {camera_location}: "
+                        f"{why_disp or why_aligned}"
+                    )
+            except Exception:
+                pass
         if tg_eligible:
             tg_id = int(
                 known_id
@@ -3835,6 +4385,8 @@ def _commit_face_candidate(
                 alert_kind = "named"
             elif is_incident:
                 alert_kind = "incident"
+            elif blacklist_tg:
+                alert_kind = "blacklist"
             else:
                 alert_kind = "watchlist"
             try:
@@ -3965,12 +4517,60 @@ def _payload_percent(item: object, default: int = 1) -> int:
         return default
 
 
+def _telegram_batch_eligible(item: dict) -> bool:
+    """Whether one batched catch should be included in Telegram flush."""
+    if not isinstance(item, dict):
+        return False
+    is_stranger = _payload_flag(item, "is_stranger")
+    is_named = _payload_flag(item, "is_named")
+    if is_named and not _telegram_alert_named():
+        return False
+    if is_stranger and not is_named:
+        return bool(_telegram_alert_non_watchlist())
+    if not is_stranger and not is_named:
+        return bool(_telegram_alert_watchlist())
+    return True
+
+
+def _dedupe_telegram_batch(items: List[dict]) -> List[dict]:
+    """Drop duplicate people from one-frame Telegram collages."""
+    try:
+        from telegram_alerts import _panels_look_identical
+    except Exception:
+        _panels_look_identical = None  # type: ignore[assignment,misc]
+    out: List[dict] = []
+    seen_ids: set[int] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            pid = int(item.get("person_id"))
+        except (TypeError, ValueError):
+            pid = None
+        if pid is not None and pid in seen_ids:
+            continue
+        face = item.get("face_bgr")
+        if face is not None and _panels_look_identical is not None:
+            dup = False
+            for prev in out:
+                prev_face = prev.get("face_bgr")
+                if prev_face is not None and _panels_look_identical(face, prev_face):
+                    dup = True
+                    break
+            if dup:
+                continue
+        if pid is not None:
+            seen_ids.add(pid)
+        out.append(item)
+    return out
+
+
 def _flush_telegram_catch_batch(
     camera_location: str,
     frame_bgr: Optional[np.ndarray],
     telegram_batch: List[dict],
 ) -> None:
-    """Send one multi-catch Telegram when 2+ faces commit together."""
+    """Send one multi-person collage when 2+ catches commit in the same frame."""
     if telegram_batch is None or isinstance(telegram_batch, np.ndarray):
         return
     try:
@@ -3979,72 +4579,44 @@ def _flush_telegram_catch_batch(
         return
     if not items:
         return
-    # Multi collage for enrolled watchlist / named matches; strangers one-by-one.
-    enrolled = [
-        item
-        for item in items
-        if isinstance(item, dict)
-        and (
-            not _payload_flag(item, "is_stranger")
-            or _payload_flag(item, "is_named")
-        )
-        and not (
-            _payload_flag(item, "is_named") and not TELEGRAM_ALERT_NAMED
-        )
-    ]
-    strangers = [
-        item
-        for item in items
-        if isinstance(item, dict)
-        and _payload_flag(item, "is_stranger")
-        and not _payload_flag(item, "is_named")
-    ]
+    eligible = _dedupe_telegram_batch(
+        [item for item in items if isinstance(item, dict) and _telegram_batch_eligible(item)]
+    )
     try:
-        if len(enrolled) >= 2:
+        if len(eligible) >= 2:
             maybe_send_multi_face_alert_async(
                 camera_zone=camera_location,
                 frame_bgr=frame_bgr,
-                faces=enrolled,
+                faces=eligible,
                 camera_name=f"CAM-{camera_location}",
                 location=str(camera_location),
-                min_percent=None,
-            )
-        elif len(enrolled) == 1:
-            item = enrolled[0]
-            named_hit = _payload_flag(item, "is_named")
-            maybe_send_target_alert_async(
-                item["face_bgr"],
-                int(item["person_id"]),
-                camera_location,
-                _payload_percent(item),
-                frame_bgr=frame_bgr,
-                person_name=item.get("person_name"),
-                camera_name=f"CAM-{camera_location}",
-                location=str(camera_location),
-                bbox=item.get("bbox"),
-                person_bbox=item.get("person_bbox"),
-                min_percent=1 if named_hit else None,
-                cooldown_sec=(
-                    TELEGRAM_NON_WATCHLIST_COOLDOWN_SEC if named_hit else None
-                ),
-                alert_kind=item.get("alert_kind") or ("named" if named_hit else "watchlist"),
-                image_quality=item.get("image_quality"),
-            )
-        for item in strangers:
-            maybe_send_target_alert_async(
-                item["face_bgr"],
-                int(item["person_id"]),
-                camera_location,
-                _payload_percent(item),
-                frame_bgr=frame_bgr,
-                person_name=item.get("person_name"),
-                camera_name=f"CAM-{camera_location}",
-                location=str(camera_location),
-                bbox=item.get("bbox"),
-                person_bbox=item.get("person_bbox"),
                 min_percent=1,
                 cooldown_sec=TELEGRAM_NON_WATCHLIST_COOLDOWN_SEC,
-                alert_kind=item.get("alert_kind", "incident"),
+            )
+        elif len(eligible) == 1:
+            item = eligible[0]
+            named_hit = _payload_flag(item, "is_named")
+            is_stranger = _payload_flag(item, "is_stranger")
+            maybe_send_target_alert_async(
+                item["face_bgr"],
+                int(item["person_id"]),
+                camera_location,
+                _payload_percent(item),
+                frame_bgr=frame_bgr,
+                person_name=item.get("person_name"),
+                camera_name=f"CAM-{camera_location}",
+                location=str(camera_location),
+                bbox=item.get("bbox"),
+                person_bbox=item.get("person_bbox"),
+                min_percent=1 if (named_hit or is_stranger) else None,
+                cooldown_sec=(
+                    TELEGRAM_NON_WATCHLIST_COOLDOWN_SEC
+                    if (named_hit or is_stranger)
+                    else None
+                ),
+                alert_kind=item.get("alert_kind") or (
+                    "named" if named_hit else "incident" if is_stranger else "watchlist"
+                ),
                 image_quality=item.get("image_quality"),
             )
     except Exception as exc:
@@ -4080,11 +4652,25 @@ def _crop_person_plate(
     frame_bgr: Optional[np.ndarray],
     bbox: Optional[Sequence[float]],
     *,
-    pad_ratio: float = 0.10,
+    pad_ratio: Optional[float] = None,
 ) -> Optional[np.ndarray]:
-    """Tight padded crop of a YOLO person box for gate captures without a face embed."""
+    """Crop inside the live YOLO/detect rectangle (blue person frame on CCTV)."""
     if frame_bgr is None or getattr(frame_bgr, "size", 0) == 0 or bbox is None:
         return None
+    if pad_ratio is None:
+        try:
+            from captures import (
+                CAPTURE_PERSON_BOX_PAD_RATIO,
+                capture_display_is_person_box,
+            )
+
+            pad_ratio = (
+                float(CAPTURE_PERSON_BOX_PAD_RATIO)
+                if capture_display_is_person_box()
+                else 0.10
+            )
+        except Exception:
+            pad_ratio = 0.10
     try:
         h, w = int(frame_bgr.shape[0]), int(frame_bgr.shape[1])
         x1, y1, x2, y2 = (float(v) for v in list(bbox)[:4])
@@ -4120,13 +4706,35 @@ def _commit_person_catch_without_embed(
     Save and Telegram a YOLO person even without a usable frontal face embed.
 
     Disabled when FACE_ONLY_CATCH=1 (user wants faces only — no back/body plates).
+
+    Body/shoulder plates cannot match Named People face embeddings, so they
+    always show up as Stranger ~1% and defeat CAPTURE_STRANGERS_ONLY.
     """
+    if not _capture_schedule_allows(camera_location):
+        return False
     if FACE_ONLY_CATCH:
         print(f"[FACE] skip person-catch (faces-only) @ cam {camera_location}")
         return False
+    # Even if FACE_ONLY_CATCH=0, never mint stranger Live Matches without a face
+    # embed when Named People are enrolled — otherwise named staff become Stranger 1%.
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM known_persons WHERE COALESCE(is_named, 0) = 1 LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            print(
+                f"[FACE] skip person-catch (named gallery active; need face) "
+                f"@ cam {camera_location}"
+            )
+            return False
+    except Exception:
+        pass
     if not _should_person_catch(camera_location):
         return False
     if now - last_logged.get(visit_key, 0.0) < cooldown:
+        return False
+    if _stationary_recapture_blocked(last_logged, camera_location, bbox, now):
+        last_logged[visit_key] = now
         return False
 
     display_crop = _crop_person_plate(frame_bgr, bbox)
@@ -4143,6 +4751,7 @@ def _commit_person_catch_without_embed(
     )
     person_label = "Stranger"
     known_id = None
+    is_stranger = True
     try:
         feature = _embedding_from_sharpened_crop(display_crop, None)
         if feature is None:
@@ -4167,6 +4776,18 @@ def _commit_person_catch_without_embed(
     except Exception:
         person_label = "Stranger"
         known_id = None
+        is_stranger = True
+
+    if _should_skip_named_capture(
+        conn,
+        is_stranger=bool(is_stranger),
+        known_id=known_id,
+        person_label=person_label,
+        camera_location=camera_location,
+    ):
+        last_logged[visit_key] = now
+        return False
+
     capture_file = save_face_capture(
         display_crop,
         known_id,
@@ -4203,6 +4824,7 @@ def _commit_person_catch_without_embed(
         display_name=person_label,
     )
     last_logged[visit_key] = now
+    _mark_stationary_captured(last_logged, camera_location, bbox, now)
     _FACE_DETECT_COUNTS[camera_location] = (
         _FACE_DETECT_COUNTS.get(camera_location, 0) + 1
     )
@@ -4222,8 +4844,8 @@ def _commit_person_catch_without_embed(
         "is_named": named_hit,
         "alert_kind": "named" if named_hit else "incident",
     }
-    send_named = bool(named_hit and TELEGRAM_ALERT_NAMED)
-    send_incident = bool((not named_hit) and TELEGRAM_ALERT_NON_WATCHLIST)
+    send_named = bool(named_hit and _telegram_alert_named())
+    send_incident = bool((not named_hit) and _telegram_alert_non_watchlist())
     if send_named or send_incident:
         if telegram_batch is not None:
             telegram_batch.append(payload)
@@ -4617,7 +5239,7 @@ def _process_detections(
                 matched_face=face_assignment_by_box_i.get(i),
                 camera_location=camera_location,
             )
-            # Soft poses: person-plate catch when enabled — never when faces-only.
+            # Soft poses / steep-angle heads: try full person-plate when enabled.
             if face_crop is not None and CATCH_EVERY_PERSON and not FACE_ONLY_CATCH:
                 try:
                     from face_print_filter import (
@@ -4626,13 +5248,9 @@ def _process_detections(
                     )
 
                     rear, rear_why = is_likely_rear_view(face_crop)
-                    if rear and not CATCH_BACKS:
-                        print(
-                            f"[FACE] skip back track @ cam {camera_location}: "
-                            f"{rear_why}"
-                        )
-                        continue
                     bad, bad_why = is_likely_non_face_object(face_crop)
+                    # Head looks rear/soft — still attempt body plate (CATCH_BACKS
+                    # is enforced inside _person_plate_ok_for_catch).
                     if rear or (bad and _allow_pose_person_fallback(bad_why)):
                         pose_why = rear_why if rear else bad_why
                         if _commit_person_catch_without_embed(
@@ -4782,6 +5400,7 @@ def _process_detections(
                 "face_area": face_area,
                 "bbox": face_xyxy
                 or [float(v) for v in np.asarray(bbox_host).reshape(-1)[:4]],
+                "person_bbox": [float(v) for v in np.asarray(bbox_host).reshape(-1)[:4]],
             }
         )
 
@@ -4810,6 +5429,21 @@ def _process_detections(
             log_count += 1
 
     # Standalone path has its own Telegram flush — keep body-track batch separate.
+    log_count += _commit_assigned_faces_same_frame(
+        conn,
+        camera_location,
+        source_np,
+        eligible_indices,
+        eligible_bboxes,
+        face_by_person_idx,
+        track_ids_t,
+        last_logged,
+        track_to_known,
+        shared_gallery,
+        cooldown,
+        now,
+        telegram_batch=telegram_batch,
+    )
     log_count += _run_face_direct_watchlist()
 
     # Commit every person with a face in this frame (not only the largest).
@@ -4829,6 +5463,7 @@ def _process_detections(
             now,
             bbox=cand.get("bbox"),
             frame_bgr=source_np,
+            person_bbox=cand.get("person_bbox"),
             telegram_batch=telegram_batch,
         ):
             log_count += 1
@@ -5079,9 +5714,9 @@ def run_multi_tracking(
             print(
                 f"Telegram alerts: "
                 f"{'ON' if telegram_configured() else 'OFF'} "
-                f"(watchlist={'ON' if TELEGRAM_ALERT_WATCHLIST else 'OFF'}, "
-                f"named={'ON' if TELEGRAM_ALERT_NAMED else 'OFF'}, "
-                f"non-watchlist={'ON' if TELEGRAM_ALERT_NON_WATCHLIST else 'OFF'}, "
+                f"(watchlist={'ON' if _telegram_alert_watchlist() else 'OFF'}, "
+                f"named={'ON' if _telegram_alert_named() else 'OFF'}, "
+                f"non-watchlist={'ON' if _telegram_alert_non_watchlist() else 'OFF'}, "
                 f"incident cooldown {int(TELEGRAM_NON_WATCHLIST_COOLDOWN_SEC)}s, "
                 f"min ≥{int(TELEGRAM_ALERT_MIN_PERCENT)}%)"
             )
@@ -5395,9 +6030,9 @@ def run_tracking(
             print(
                 f"Telegram alerts: "
                 f"{'ON' if telegram_configured() else 'OFF'} "
-                f"(watchlist={'ON' if TELEGRAM_ALERT_WATCHLIST else 'OFF'}, "
-                f"named={'ON' if TELEGRAM_ALERT_NAMED else 'OFF'}, "
-                f"non-watchlist={'ON' if TELEGRAM_ALERT_NON_WATCHLIST else 'OFF'}, "
+                f"(watchlist={'ON' if _telegram_alert_watchlist() else 'OFF'}, "
+                f"named={'ON' if _telegram_alert_named() else 'OFF'}, "
+                f"non-watchlist={'ON' if _telegram_alert_non_watchlist() else 'OFF'}, "
                 f"incident cooldown {int(TELEGRAM_NON_WATCHLIST_COOLDOWN_SEC)}s, "
                 f"min ≥{int(TELEGRAM_ALERT_MIN_PERCENT)}%)"
             )

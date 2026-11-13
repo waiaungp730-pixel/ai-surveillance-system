@@ -13,8 +13,10 @@ CAMERAS_PATH = PROJECT_DIR / "cameras.json"
 GO2RTC_OUT = NVR_DIR / "go2rtc.yaml"
 SNAPSHOTS_OUT = NVR_DIR / "nginx-snapshots.conf"
 SNAPSHOT_PORT_BASE = 18089
-# MSA CCTV already owns :1984 — this project's go2rtc listens here.
-GO2RTC_PORT = int(os.environ.get("GO2RTC_PORT", "1985"))
+# MSA_CCTV_100 owns :1984, MSA_CCTV owns :1985 — this project uses :1986.
+GO2RTC_PORT = int(os.environ.get("GO2RTC_PORT", "1986"))
+GO2RTC_RTSP_PORT = int(os.environ.get("GO2RTC_RTSP_PORT", "8558"))
+GO2RTC_WEBRTC_PORT = int(os.environ.get("GO2RTC_WEBRTC_PORT", "8559"))
 # Outdoor gate cams get ffmpeg deshake (wind / mount shake).
 _STABILIZE_DEFAULT = "3,28,29,30"
 STABILIZE_CAMERAS = frozenset(
@@ -38,19 +40,37 @@ _FFMPEG_CANDIDATES = [
 
 
 def resolve_ffmpeg() -> str:
+    """Return an ffmpeg path safe for go2rtc exec (no unquoted spaces)."""
     env = (os.environ.get("FFMPEG_BIN") or os.environ.get("FFMPEG_PATH") or "").strip()
     if env and Path(env).is_file():
-        return str(Path(env).resolve())
+        resolved = str(Path(env).resolve())
+        # go2rtc exec does not quote bin paths — spaces break "C:/Program Files/...".
+        if " " not in resolved:
+            return resolved
     which = shutil.which("ffmpeg")
     if which:
-        return str(Path(which).resolve())
+        # Prefer bare name on PATH so go2rtc never sees "Program Files".
+        return "ffmpeg"
     for cand in _FFMPEG_CANDIDATES:
         if cand is None:
             continue
-        if cand.is_file():
+        if cand.is_file() and " " not in str(cand):
             return str(cand.resolve())
+    # Last resort: copy/link into nvr/ (no spaces).
+    nvr_ffmpeg = NVR_DIR / "ffmpeg.exe"
+    if nvr_ffmpeg.is_file():
+        return str(nvr_ffmpeg.resolve())
+    for cand in _FFMPEG_CANDIDATES:
+        if cand is None or not cand.is_file():
+            continue
+        try:
+            shutil.copy2(cand, nvr_ffmpeg)
+            return str(nvr_ffmpeg.resolve())
+        except OSError:
+            continue
     raise SystemExit(
-        "ffmpeg not found. Install ffmpeg or set FFMPEG_BIN to ffmpeg.exe, then re-run."
+        "ffmpeg not found. Install ffmpeg on PATH (no spaces in path), "
+        "or set FFMPEG_BIN, then re-run."
     )
 
 
@@ -67,16 +87,25 @@ def main() -> None:
         "# Auto-generated from cameras.json — real-time WebRTC (not JPEG)",
         "# Re-run: py -3.12 nvr/generate_configs.py",
         f"# go2rtc :{GO2RTC_PORT} — RTSP → WebRTC/MSE via ffmpeg H.264",
+        f"# rtsp :{GO2RTC_RTSP_PORT}  webrtc :{GO2RTC_WEBRTC_PORT}",
         f"# ffmpeg: {ffmpeg_bin}",
         f"# stabilize cams: {', '.join(sorted(STABILIZE_CAMERAS)) or '(none)'}",
         "",
         "api:",
-        # Localhost-only bind (security). origin * is OK — Flask proxies /go2rtc.
-        f'  listen: "127.0.0.1:{GO2RTC_PORT}"',
+        # Prefer all-interfaces so Flask proxy + LAN browsers can reach it.
+        # Port must not collide with MSA (:1984 / :1985).
+        f'  listen: ":{GO2RTC_PORT}"',
         '  origin: "*"',
         "",
+        # Required: ffmpeg transcode uses {output} → local RTSP (else "rtsp module disabled").
+        # Bind all interfaces like MSA configs — host-only listen can leave rtsp.Port empty in some builds.
+        "rtsp:",
+        f'  listen: ":{GO2RTC_RTSP_PORT}"',
+        "",
         "webrtc:",
+        f'  listen: ":{GO2RTC_WEBRTC_PORT}"',
         "  candidates:",
+        f"    - 127.0.0.1:{GO2RTC_WEBRTC_PORT}",
         "    - stun:stun.l.google.com:19302",
         "",
         "ffmpeg:",
@@ -87,26 +116,60 @@ def main() -> None:
     for cam in cams:
         cid = str(cam["id"]).strip()
         src = str(cam["source"]).strip()
-        # Prefer NVR substream (subtype=1). Fixed even height for libx264.
+        # Prefer main stream (subtype=0) first — some NVR channels have broken subtype=1.
         sub = src.replace("subtype=0", "subtype=1") if "subtype=0" in src else src
         stabilize = cid in STABILIZE_CAMERAS
         # Outdoor gates: deshake reduces wind/mount shake in the 2×2 live view.
+        # H.265/any → H.264 @ 640px (NVR 2×2 WebRTC budget).
+        # #rtsp_transport=tcp matches working MSA go2rtc configs.
         if stabilize:
-            stream_url = (
-                f"ffmpeg:{sub}#video=h264#width=960#height=540"
+            main_url = (
+                f"ffmpeg:{src}#rtsp_transport=tcp#video=h264#width=640#height=360"
+                f"#raw=-vf deshake=rx=64:ry=64:edge=mirror"
+            )
+            sub_url = (
+                f"ffmpeg:{sub}#rtsp_transport=tcp#video=h264#width=640#height=360"
                 f"#raw=-vf deshake=rx=64:ry=64:edge=mirror"
             )
         else:
-            stream_url = f"ffmpeg:{sub}#video=h264#width=960#height=540"
+            main_url = f"ffmpeg:{src}#rtsp_transport=tcp#video=h264#width=640#height=360"
+            sub_url = f"ffmpeg:{sub}#rtsp_transport=tcp#video=h264#width=640#height=360"
         lines.append(f"  cam{cid}:")
-        lines.append(f"    - {stream_url}")
-        if sub != src and not stabilize:
-            lines.append(f"    - ffmpeg:{src}#video=h264#width=960#height=540")
+        lines.append(f"    - {main_url}")
+        lines.append(f"    - {src}#rtsp_transport=tcp")
+        if sub != src:
+            lines.append(f"    - {sub_url}")
+            lines.append(f"    - {sub}#rtsp_transport=tcp")
+
+    # Higher-res restreams for ANPR plate OCR (gate / configured plate cameras).
+    plate_ids = {
+        c.strip()
+        for c in os.environ.get("LICENSE_PLATE_CAMERAS", "1,3,28,29,30").split(",")
+        if c.strip()
+    }
+    plate_count = 0
+    for cam in cams:
+        cid = str(cam["id"]).strip()
+        if cid not in plate_ids:
+            continue
+        src = str(cam["source"]).strip()
+        sub = src.replace("subtype=0", "subtype=1") if "subtype=0" in src else src
+        lines.append(f"  plate_cam{cid}:")
+        lines.append(
+            f"    - ffmpeg:{src}#rtsp_transport=tcp#video=h264#width=1280#height=720"
+        )
+        lines.append(f"    - {src}#rtsp_transport=tcp")
+        if sub != src:
+            lines.append(
+                f"    - ffmpeg:{sub}#rtsp_transport=tcp#video=h264#width=1280#height=720"
+            )
+            lines.append(f"    - {sub}#rtsp_transport=tcp")
+        plate_count += 1
 
     GO2RTC_OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"Wrote {GO2RTC_OUT} ({len(cams)} realtime streams @960x540 H.264)")
+    print(f"Wrote {GO2RTC_OUT} ({len(cams)} live @640x360 + {plate_count} plate @1280x720)")
     print(f"ffmpeg: {ffmpeg_bin}")
-    print(f"go2rtc listen: 127.0.0.1:{GO2RTC_PORT}")
+    print(f"go2rtc listen: :{GO2RTC_PORT}  rtsp:{GO2RTC_RTSP_PORT}  webrtc:{GO2RTC_WEBRTC_PORT}")
 
     snap: list[str] = [
         "# JPEG snapshot proxies only (fallback stills — not used for live video)",

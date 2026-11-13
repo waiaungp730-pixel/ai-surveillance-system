@@ -410,6 +410,23 @@ def is_likely_rear_view(face_bgr: Optional[np.ndarray]) -> Tuple[bool, str]:
                         f"headInner={head_inner_skin:.2f},floorV={floor_v:.0f},"
                         f"topSkin={top_skin:.2f},edge={floor_edge:.2f})"
                     )
+                # Side / rear-quarter body plates: hair crown + neck/shoulder skin
+                # fill the "head" strip (arm skin fools no-face gates), bright floor.
+                # Example: brown-shirt hallway walker looking down away from camera.
+                if (
+                    full_h >= int(full_w * 1.50)
+                    and floor_v >= 110.0
+                    and floor_edge >= 0.08
+                    and top_skin < 0.14
+                    and head_u < 0.14
+                    and head_m >= 0.28
+                    and head_l >= 0.22
+                ):
+                    return True, (
+                        f"rear_view_side_turned(topSkin={top_skin:.2f},"
+                        f"hu={head_u:.2f},hm={head_m:.2f},hl={head_l:.2f},"
+                        f"floorV={floor_v:.0f},edge={floor_edge:.2f})"
+                    )
                 # Ears/neck only in the head strip — no mouth/chin band.
                 if (
                     head_l < 0.06
@@ -495,6 +512,76 @@ def is_likely_rear_view(face_bgr: Optional[np.ndarray]) -> Tuple[bool, str]:
                 f"rear_view_no_face_bright(u={upper:.2f},skin={inner_skin:.2f})"
             )
 
+        # Seated / standing shirt-back (desk cams): saturated clothing fills mid+lower
+        # while the head strip is hair/ear/neck — not a usable frontal face.
+        if full_h >= int(full_w * 1.28):
+            mid_band = full[int(full_h * 0.30) : max(int(full_h * 0.31), int(full_h * 0.72))]
+            bot_band = full[int(full_h * 0.62) :]
+            if mid_band.size >= 64 and bot_band.size >= 48:
+                mid_skin_b = _skin_fraction_bgr(mid_band)
+                bot_skin_b = _skin_fraction_bgr(bot_band)
+                mid_hsv_b = cv2.cvtColor(mid_band, cv2.COLOR_BGR2HSV)
+                mid_sat_b = float(mid_hsv_b[:, :, 1].mean())
+                blue_frac = float(
+                    np.mean(
+                        (mid_hsv_b[:, :, 0] >= 85)
+                        & (mid_hsv_b[:, :, 0] <= 135)
+                        & (mid_hsv_b[:, :, 1] >= 35)
+                    )
+                )
+                clothing_mid = mid_skin_b <= 0.14 and (
+                    mid_sat_b >= 45.0 or blue_frac >= 0.22
+                )
+                head_strip = full[0 : max(12, int(full_h * 0.34))]
+                hh, hw = int(head_strip.shape[0]), int(head_strip.shape[1])
+                head_center = head_strip[
+                    int(hh * 0.18) : max(int(hh * 0.19), int(hh * 0.82)),
+                    int(hw * 0.22) : max(int(hw * 0.23), int(hw * 0.78)),
+                ]
+                head_center_skin = (
+                    _skin_fraction_bgr(head_center)
+                    if head_center.size >= 32
+                    else _skin_fraction_bgr(head_strip)
+                )
+                hu, hm, hl = _horizontal_skin_bands(head_strip)
+                # Clear frontal faces keep cheek skin in the head mid band.
+                # Ear/neck spikes (rear/side) inflate hm or headC without a mouth/chin.
+                ear_heavy = hm >= 0.40 and hm > (hu + 0.10)
+                no_frontal = (
+                    head_center_skin < 0.28
+                    or hl < 0.09
+                    or ear_heavy
+                    or (hu < 0.15 and hm < 0.15)
+                )
+                if clothing_mid and bot_skin_b <= 0.14 and no_frontal:
+                    return True, (
+                        f"rear_view_shirt_back(mSkin={mid_skin_b:.2f},"
+                        f"bSkin={bot_skin_b:.2f},mSat={mid_sat_b:.0f},"
+                        f"blue={blue_frac:.2f},headC={head_center_skin:.2f},"
+                        f"hu={hu:.2f},hm={hm:.2f},hl={hl:.2f})"
+                    )
+
+                # High-angle looking-down: hair/shoulders fill the top, face hidden.
+                head_gray = cv2.cvtColor(head_strip, cv2.COLOR_BGR2GRAY)
+                crown_dark = float(np.mean(head_gray < 95))
+                crown_skin = _skin_fraction_bgr(
+                    head_strip[0 : max(1, hh // 3)]
+                ) if hh >= 9 else top_skin_t
+                if (
+                    full_h >= int(full_w * 1.40)
+                    and head_center_skin < 0.22
+                    and hl < 0.22
+                    and (
+                        (crown_dark >= 0.22 and crown_skin <= 0.45)
+                        or (hu >= 0.22 and hm < hu + 0.05)
+                    )
+                ):
+                    return True, (
+                        f"rear_view_looking_down(crownDark={crown_dark:.2f},"
+                        f"crownSkin={crown_skin:.2f},headC={head_center_skin:.2f},"
+                        f"hl={hl:.2f},hu={hu:.2f},hm={hm:.2f})"
+                    )
+
         # No face skin in forehead/cheek bands.
         if upper < 0.07 and mid < 0.08 and face_skin < 0.14:
             return True, f"rear_view_no_face(u={upper:.2f},m={mid:.2f})"
@@ -539,6 +626,91 @@ def is_likely_rear_view(face_bgr: Optional[np.ndarray]) -> Tuple[bool, str]:
             return True, (
                 f"rear_view_ears_neck(u={upper:.2f},m={mid:.2f},l={lower:.2f})"
             )
+
+        # Both ears from behind (office / car seats): dark hair crown, ear/nape
+        # skin in upper+mid bands, essentially no mouth/chin, shirt/chair below.
+        # High upper skin from ears used to defeat the "no face" gates.
+        if (
+            top_dark >= 0.40
+            and lower <= 0.08
+            and mid >= 0.15
+            and bot_skin <= 0.14
+            and face_skin <= 0.48
+            and (upper >= 0.12 or mid >= 0.22)
+            and top_skin >= 0.12
+        ):
+            return True, (
+                f"rear_view_both_ears(topDark={top_dark:.2f},u={upper:.2f},"
+                f"m={mid:.2f},l={lower:.2f},bot={bot_skin:.2f})"
+            )
+
+        # Hallway / doorway walking-away: half the plate is blown-out floor or
+        # glass, the other half is hair/shoulder/arm. RetinaFace often locks onto
+        # the arm as a "face" and skin gates fail because arm skin is abundant.
+        full_gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        left_m = float(full_gray[:, : max(1, w // 2)].mean())
+        right_m = float(full_gray[:, max(1, w // 2) :].mean())
+        lr_diff = abs(left_m - right_m)
+        hi_m = max(left_m, right_m)
+        lo_m = min(left_m, right_m)
+        bright_frac = float(np.mean(full_gray >= 175))
+        dark_frac = float(np.mean(full_gray < 100))
+        if (
+            hi_m >= 160.0
+            and lo_m <= 120.0
+            and lr_diff >= 45.0
+            and bright_frac >= 0.20
+            and dark_frac >= 0.10
+            and (top_dark >= 0.15 or (top_skin < 0.12 and bright_frac >= 0.35))
+            and (bot_skin >= 0.18 or mid >= 0.20 or face_skin >= 0.25)
+        ):
+            return True, (
+                f"rear_view_shoulder_floor(lr={lr_diff:.0f},hi={hi_m:.0f},"
+                f"lo={lo_m:.0f},bright={bright_frac:.2f},topDark={top_dark:.2f})"
+            )
+
+        # One-ear rear view: dark hair crown + skin almost entirely on one mid
+        # side (ear / nape). RetinaFace often locks onto the ear as a "face"
+        # and skin-fraction gates miss it because ear+neck look like cheeks.
+        # Keep thresholds strict so looking-down / phone poses are not rejected.
+        mid_band = arr[h // 3 : max(h // 3 + 1, 2 * h // 3)]
+        if mid_band.size >= 64 and mid_band.shape[1] >= 8:
+            mid_l = _skin_fraction_bgr(mid_band[:, : mid_band.shape[1] // 2])
+            mid_r = _skin_fraction_bgr(mid_band[:, mid_band.shape[1] // 2 :])
+            mid_asym = abs(mid_l - mid_r)
+            mid_hi = max(mid_l, mid_r)
+            mid_lo = min(mid_l, mid_r)
+            low_side = mid_band[:, : mid_band.shape[1] // 2] if mid_l <= mid_r else mid_band[:, mid_band.shape[1] // 2 :]
+            low_side_dark = float(
+                np.mean(cv2.cvtColor(low_side, cv2.COLOR_BGR2GRAY) < 95)
+            )
+            if (
+                top_dark >= 0.48
+                and top_skin <= 0.42
+                and mid_asym >= 0.58
+                and mid_hi >= 0.70
+                and mid_lo <= 0.32
+                and low_side_dark >= 0.35
+                and face_skin >= 0.25
+            ):
+                return True, (
+                    f"rear_view_one_ear(topDark={top_dark:.2f},"
+                    f"mL={mid_l:.2f},mR={mid_r:.2f},asym={mid_asym:.2f})"
+                )
+            # Softer both-ears / nape: modest L/R ear skin + no chin band.
+            if (
+                top_dark >= 0.42
+                and lower <= 0.08
+                and mid_hi >= 0.18
+                and bot_skin <= 0.14
+                and face_skin <= 0.45
+                and mid_l >= 0.10
+                and mid_r >= 0.10
+            ):
+                return True, (
+                    f"rear_view_two_ears(topDark={top_dark:.2f},"
+                    f"mL={mid_l:.2f},mR={mid_r:.2f},l={lower:.2f})"
+                )
 
         return False, ""
     except Exception:
@@ -738,6 +910,21 @@ def is_likely_invalid_face_crop(face_bgr: Optional[np.ndarray]) -> Tuple[bool, s
         if mid >= 0.55 and upper < 0.25 and lower < 0.22 and dark_upper >= 0.45:
             return True, f"top_of_head(mid={mid:.2f},dark={dark_upper:.2f})"
 
+        # Both ears from behind — ear skin inflates upper/mid so older back_of_head
+        # gates miss; require near-zero chin/mouth band + dark crown.
+        if (
+            dark_upper >= 0.40
+            and lower < 0.08
+            and mid >= 0.15
+            and upper >= 0.12
+            and bottom_skin < 0.15
+            and skin <= 0.50
+        ):
+            return True, (
+                f"back_of_head_ears(u={upper:.2f},m={mid:.2f},l={lower:.2f},"
+                f"dark={dark_upper:.2f})"
+            )
+
         # Back of head / crown — skin/hair top-heavy, no mid-face or mouth band.
         if (
             upper >= 0.06
@@ -775,6 +962,92 @@ def is_likely_invalid_face_crop(face_bgr: Optional[np.ndarray]) -> Tuple[bool, s
             spread = max(upper, mid, lower) - min(upper, mid, lower)
             if spread < 0.14 and bands_with_skin >= 2:
                 return True, f"uniform_skin_patch(skin={skin:.2f},spread={spread:.2f})"
+
+        # Dog / animal hindquarters — brown fur reads as YCrCb "skin" on top,
+        # but there is no chin/mouth band (lower skin ≈ 0). Real faces keep
+        # cheek + chin pixels in the lower third.
+        if upper >= 0.28 and lower < 0.04 and mid < 0.14:
+            return True, (
+                f"animal_hindquarters(u={upper:.2f},m={mid:.2f},l={lower:.2f})"
+            )
+
+        animal, animal_why = is_likely_animal_or_dog(arr)
+        if animal:
+            return True, animal_why
+
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def is_likely_animal_or_dog(face_bgr: Optional[np.ndarray]) -> Tuple[bool, str]:
+    """
+    Reject dog / animal body crops that YOLO+RetinaFace treat as faces.
+
+    Outdoor gate cams (CAM-28–30) often lock onto walking dogs: brown fur
+    registers as YCrCb skin and gender/age invents ``Male / 38``.
+    """
+    if face_bgr is None or getattr(face_bgr, "size", 0) == 0:
+        return False, ""
+    try:
+        arr = np.asarray(face_bgr)
+        if arr.ndim < 3 or arr.shape[2] < 3:
+            return False, ""
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        if min(h, w) < 24:
+            return False, ""
+
+        aspect = w / float(max(1, h))
+        hsv = cv2.cvtColor(arr, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        skin = _skin_fraction_bgr(arr)
+        upper, mid, lower = _horizontal_skin_bands(arr)
+
+        # Warm brown / tan fur (dogs, cats) — broader than wood brown.
+        fur = cv2.inRange(hsv, (5, 25, 35), (35, 220, 220))
+        fur_frac = float(cv2.countNonZero(fur)) / float(max(1, fur.size))
+        green = cv2.inRange(hsv, (35, 40, 40), (90, 255, 255))
+        green_frac = float(cv2.countNonZero(green)) / float(max(1, green.size))
+
+        # Texture: fur is finely speckled vs smooth face skin.
+        lap = cv2.Laplacian(gray, cv2.CV_32F)
+        lap_std = float(lap.std())
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 40, 120)
+        edge_frac = float(cv2.countNonZero(edges)) / float(max(1, edges.size))
+
+        # Wide body plate (side-on dog) — human face crops are nearer square.
+        if aspect >= 1.35 and fur_frac >= 0.22 and skin >= 0.12:
+            return True, (
+                f"animal_body(aspect={aspect:.2f},fur={fur_frac:.2f},"
+                f"skin={skin:.2f})"
+            )
+
+        # Fur-dominated crop with outdoor ground/grass fringe.
+        if (
+            fur_frac >= 0.30
+            and skin >= 0.18
+            and green_frac >= 0.04
+            and lap_std >= 18.0
+            and upper < 0.35
+        ):
+            return True, (
+                f"animal_fur(fur={fur_frac:.2f},green={green_frac:.2f},"
+                f"lap={lap_std:.0f})"
+            )
+
+        # Long horizontal creature: lots of mid-band "skin", weak face layout.
+        if (
+            aspect >= 1.15
+            and mid >= 0.22
+            and upper < 0.22
+            and lower < 0.18
+            and fur_frac >= 0.18
+            and edge_frac >= 0.05
+        ):
+            return True, (
+                f"animal_side(aspect={aspect:.2f},fur={fur_frac:.2f},"
+                f"uml={upper:.2f}/{mid:.2f}/{lower:.2f})"
+            )
 
         return False, ""
     except Exception:
@@ -982,6 +1255,8 @@ def is_likely_wheel_or_bicycle(face_bgr: Optional[np.ndarray]) -> Tuple[bool, st
     True for bicycle / scooter wheels and similar circular metal hubs.
 
     RetinaFace sometimes locks onto a wheel hub as a 'face' at outdoor gates.
+    Gravel / dirt under the tire often reads as 'skin' to HSV heuristics, so
+    skin limits stay relatively permissive when circle+metal evidence is strong.
     """
     if face_bgr is None or getattr(face_bgr, "size", 0) == 0:
         return False, ""
@@ -995,7 +1270,9 @@ def is_likely_wheel_or_bicycle(face_bgr: Optional[np.ndarray]) -> Tuple[bool, st
             return False, ""
 
         skin = _skin_fraction_bgr(arr)
-        if skin >= 0.28:
+        # Real faces usually have more contiguous skin; allow gravel false-skin
+        # up to ~0.40 when the plate is clearly a metal wheel.
+        if skin >= 0.42:
             return False, ""
 
         gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
@@ -1021,41 +1298,53 @@ def is_likely_wheel_or_bicycle(face_bgr: Optional[np.ndarray]) -> Tuple[bool, st
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=max(16, side // 3),
-            param1=110,
-            param2=26,
-            minRadius=max(8, side // 10),
-            maxRadius=max(12, side // 2),
+            minDist=max(12, side // 4),
+            param1=100,
+            param2=22,
+            minRadius=max(6, side // 12),
+            maxRadius=max(12, int(side * 0.55)),
         )
         n_circ = 0 if circles is None else int(circles.shape[1])
         # Dominant circle covering most of the plate (wheel rim).
         big_rim = False
         if circles is not None:
             for c in circles[0]:
-                if float(c[2]) >= side * 0.28:
+                if float(c[2]) >= side * 0.26:
                     big_rim = True
                     break
 
         if (
             (n_circ >= 2 or big_rim)
-            and metal >= 0.45
-            and sat_mean <= 55.0
-            and skin < 0.22
-            and (ring_edge >= 0.08 or edge_frac >= 0.09)
+            and metal >= 0.40
+            and sat_mean <= 60.0
+            and skin < 0.36
+            and (ring_edge >= 0.07 or edge_frac >= 0.08)
         ):
             return True, (
                 f"bicycle_wheel(circ={n_circ},metal={metal:.2f},skin={skin:.2f},"
                 f"ring={ring_edge:.2f},S={sat_mean:.0f})"
             )
+        # Strong multi-circle metal hub even when gravel inflates skin a bit.
+        if (
+            n_circ >= 4
+            and metal >= 0.55
+            and sat_mean <= 45.0
+            and edge_frac >= 0.12
+            and skin < 0.40
+        ):
+            return True, (
+                f"bicycle_wheel_hub(circ={n_circ},metal={metal:.2f},skin={skin:.2f},"
+                f"edge={edge_frac:.2f})"
+            )
         # Spoke-heavy metal plate without enough face skin bands.
         upper, mid, lower = _horizontal_skin_bands(arr)
         if (
-            metal >= 0.65
-            and sat_mean <= 40.0
-            and skin < 0.18
+            metal >= 0.55
+            and sat_mean <= 45.0
+            and skin < 0.34
             and edge_frac >= 0.10
-            and lower < 0.10
-            and max(upper, mid) < 0.22
+            and lower < 0.18
+            and max(upper, mid) < 0.30
         ):
             return True, (
                 f"metal_spokes(metal={metal:.2f},skin={skin:.2f},edge={edge_frac:.2f})"
@@ -1108,6 +1397,8 @@ _KEEP_PERSON_POSE_MARKERS = (
     "crown_neck",
     "nape",
     "ears_neck",
+    "both_ears",
+    "two_ears",
     "neck_only",
     "dull_hair",
     "no_face_bright",
@@ -1137,10 +1428,16 @@ _JUNK_NON_PERSON_MARKERS = (
     "torso_strap",
     "shoulder_torso",
     "bicycle_wheel",
+    "bicycle_wheel_hub",
     "metal_spokes",
     "too_tiny",
     "tiny_mush",
     "soft_blob",
+    "animal_hindquarters",
+    "animal_body",
+    "animal_fur",
+    "animal_side",
+    "quadruped",
 )
 
 
@@ -1177,11 +1474,66 @@ _JUNK_PERSON_PLATE_MARKERS = (
     "torso_strap",
     "shoulder_torso",
     "bicycle_wheel",
+    "bicycle_wheel_hub",
     "metal_spokes",
     "too_tiny",
     "tiny_mush",
     "soft_blob",
+    "animal_hindquarters",
+    "animal_body",
+    "animal_fur",
+    "animal_side",
+    "quadruped",
 )
+
+
+def person_bbox_suggests_quadruped(
+    person_bbox: Optional[Sequence[float]],
+    face_bbox: Optional[Sequence[float]],
+) -> Tuple[bool, str]:
+    """
+    YOLO class-0 on a dog: wide box with the RetinaFace hit on the rump/legs.
+    """
+    if person_bbox is None or face_bbox is None:
+        return False, ""
+    try:
+        px1, py1, px2, py2 = (float(v) for v in person_bbox[:4])
+        fx1, fy1, fx2, fy2 = (float(v) for v in face_bbox[:4])
+    except (TypeError, ValueError, IndexError):
+        return False, ""
+    pw = max(1.0, px2 - px1)
+    ph = max(1.0, py2 - py1)
+    # Side-on dogs are wide; also catch near-square squat animal boxes.
+    if pw < ph * 1.05:
+        return False, ""
+    face_cy = 0.5 * (fy1 + fy2)
+    person_cy = 0.5 * (py1 + py2)
+    face_h = max(1.0, fy2 - fy1)
+    face_w = max(1.0, fx2 - fx1)
+    # Face hit sits in the lower half / rump of a wide person box.
+    if face_cy > person_cy + ph * 0.04:
+        return True, (
+            f"quadruped_bbox(pw={pw:.0f},ph={ph:.0f},"
+            f"faceBelow={face_cy - person_cy:.0f})"
+        )
+    # "Face" crop itself is a wide animal body strip inside a wide YOLO box.
+    if pw >= ph * 1.15 and face_w >= face_h * 1.25:
+        return True, (
+            f"quadruped_wide_face(pw={pw:.0f},ph={ph:.0f},"
+            f"fw={face_w:.0f},fh={face_h:.0f})"
+        )
+    return False, ""
+
+
+def capture_crop_passes_human_gate(face_bgr: Optional[np.ndarray]) -> Tuple[bool, str]:
+    """True when a saved / Telegram crop plausibly contains a human face."""
+    bad, reason = is_likely_invalid_face_crop(face_bgr)
+    if bad:
+        return False, reason
+    bad_obj, obj_reason = is_likely_non_face_object(face_bgr)
+    if bad_obj and is_junk_person_plate_reason(obj_reason):
+        return False, obj_reason
+    return True, ""
 
 
 def is_junk_person_plate_reason(reason: str) -> bool:

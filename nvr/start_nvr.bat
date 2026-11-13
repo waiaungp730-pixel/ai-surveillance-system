@@ -26,18 +26,19 @@ if errorlevel 1 (
   )
 )
 
-echo Starting go2rtc on :1984 ...
+REM MSA_CCTV_100 owns :1984, MSA_CCTV owns :1985 — this project uses :1986
+echo Starting go2rtc on :1986 ...
 start "go2rtc" /min "%GO2RTC_BIN%" -config "%~dp0go2rtc.yaml"
 REM Avoid `timeout` (fails under some redirected shells)
 ping -n 3 127.0.0.1 >nul
 
 where nginx >nul 2>&1
 if errorlevel 1 (
-  echo nginx optional — use http://127.0.0.1:5000 + go2rtc :1984
+  echo nginx optional — use http://127.0.0.1:5000 + go2rtc :1986
 ) else (
   nginx -c "%~dp0nginx.conf" -p "%~dp0"
   echo Open http://127.0.0.1:8088  ^(Live Cameras = real-time WebRTC^)
 )
 
-echo go2rtc UI: http://127.0.0.1:1984/
+echo go2rtc UI: http://127.0.0.1:1986/
 endlocal

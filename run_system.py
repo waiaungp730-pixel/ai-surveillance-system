@@ -18,6 +18,8 @@ Requires Python 3.12+ with PyTorch installed (use: py -3.12 run_system.py).
 
 from __future__ import annotations
 
+import numpy_compat  # noqa: F401  — NumPy 1.x / 2.x import bridge
+
 import argparse
 import json
 import logging
@@ -25,12 +27,15 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 from camera_stats import read_faces_detected
 from inference_device import (
@@ -64,6 +69,8 @@ SYSTEM_STATUS_PATH = PROJECT_DIR / "system_status.json"
 
 STREAM_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
 CAMERA_VALIDATE_TIMEOUT = 5.0
+CAMERA_VALIDATE_TCP_PROBE_SEC = float(os.environ.get("CAMERA_VALIDATE_TCP_PROBE_SEC", "1.2"))
+CAMERA_VALIDATE_WORKERS = max(1, int(os.environ.get("CAMERA_VALIDATE_WORKERS", "8")))
 CAMERA_START_STAGGER_SEC = 2.0
 OSNET_WEIGHTS = PROJECT_DIR / "models" / "osnet_x1_0_reid.pth"
 
@@ -307,11 +314,46 @@ def _resolve_probe_target(source: str) -> Optional[str]:
     return None
 
 
+def _rtsp_host_port(source: str) -> Optional[Tuple[str, int]]:
+    try:
+        parsed = urlparse(str(source or "").strip())
+    except Exception:
+        return None
+    host = parsed.hostname
+    if not host:
+        return None
+    port = parsed.port
+    if port is None:
+        scheme = (parsed.scheme or "").lower()
+        if scheme == "rtsp":
+            port = 554
+        elif scheme == "https":
+            port = 443
+        elif scheme in ("http", "rtmp"):
+            port = 80 if scheme == "http" else 1935
+        else:
+            return None
+    return host, int(port)
+
+
+def _tcp_host_reachable(source: str, timeout: float = CAMERA_VALIDATE_TCP_PROBE_SEC) -> Tuple[bool, str]:
+    """Fast LAN probe — offline cams fail here instead of waiting on ffprobe."""
+    endpoint = _rtsp_host_port(source)
+    if endpoint is None:
+        return True, "ok"
+    host, port = endpoint
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, "ok"
+    except OSError as exc:
+        return False, f"host {host}:{port} unreachable within {timeout:.1f}s ({exc})"
+
+
 def _validate_camera_source(
     source: str, timeout: float = CAMERA_VALIDATE_TIMEOUT
 ) -> Tuple[bool, str]:
     """
-    Probe camera reachability with ffprobe (RTSP/TCP).
+    Probe camera reachability with a fast TCP check, then optional ffprobe.
     Returns (ok, reason). Never raises.
     """
     try:
@@ -321,16 +363,22 @@ def _validate_camera_source(
         if "${" in stripped:
             return False, "unresolved ${...} placeholder"
 
-        ffprobe = shutil.which("ffprobe")
-        if ffprobe is None:
-            return True, "ffprobe not installed — skipping"
-
         if stripped.isdigit():
             return True, "ok (local device — ffprobe skipped)"
 
         probe_target = _resolve_probe_target(stripped)
         if probe_target is None:
             return False, f"video file not found: {stripped}"
+
+        # Network URLs: fail fast when the host is offline.
+        if str(probe_target).lower().startswith(("rtsp://", "http://", "https://")):
+            tcp_ok, tcp_reason = _tcp_host_reachable(probe_target)
+            if not tcp_ok:
+                return False, tcp_reason
+
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe is None:
+            return True, "ffprobe not installed — skipping"
 
         cmd = [
             ffprobe,
@@ -366,6 +414,29 @@ def _validate_camera_source(
         return False, f"timeout after {timeout}s"
     except Exception as exc:
         return False, str(exc)
+
+
+def _validate_cameras_parallel(
+    configs: List[Tuple[str, str, str]],
+) -> List[Tuple[str, Tuple[bool, str]]]:
+    """Validate camera sources concurrently (offline cams don't serialize startup)."""
+    if not configs:
+        return []
+
+    def _one(item: Tuple[str, str, str]) -> Tuple[str, Tuple[bool, str]]:
+        name, source, _location = item
+        return name, _validate_camera_source(source)
+
+    results: List[Tuple[str, Tuple[bool, str]]] = []
+    workers = min(CAMERA_VALIDATE_WORKERS, max(1, len(configs)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, cfg) for cfg in configs]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    # Keep original camera order for readable logs.
+    order = {name: i for i, (name, _src, _loc) in enumerate(configs)}
+    results.sort(key=lambda row: order.get(row[0], 0))
+    return results
 
 
 def _check_face_pipeline() -> Tuple[bool, bool, bool]:
@@ -474,6 +545,16 @@ def _parse_args() -> argparse.Namespace:
         metavar="WxH",
         help="AI inference letterbox only (display stays full-res). Default: 640x360",
     )
+    parser.add_argument(
+        "--plates",
+        action="store_true",
+        help="Force-enable license plate capture on gate cameras",
+    )
+    parser.add_argument(
+        "--no-plates",
+        action="store_true",
+        help="Disable license plate capture worker",
+    )
     return parser.parse_args()
 
 
@@ -513,6 +594,7 @@ _use_unified_tracker = False
 _cameras_lock = threading.Lock()
 _dashboard: Optional[subprocess.Popen] = None
 _go2rtc: Optional[subprocess.Popen] = None
+_plate_capture: Optional[subprocess.Popen] = None
 _INFERENCE_DEVICE: str = "auto"
 _FRAME_SKIP: int = 3
 _INFERENCE_SIZE: str = "640x360"
@@ -561,7 +643,8 @@ class CameraProcess:
 
     @property
     def faces_detected(self) -> int:
-        return read_faces_detected(self.location)
+        # Tracker may publish stats under camera id (name) or location label.
+        return max(read_faces_detected(self.name), read_faces_detected(self.location))
 
     @property
     def log_prefix(self) -> str:
@@ -581,8 +664,10 @@ class CameraProcess:
             str(self.frame_skip),
             "--inference-size",
             self.inference_size,
+            # Use stable camera id (not location IP) so live_preview/cameras/{id}.jpg
+            # matches Live Stream / go2rtc cam{N} stream names.
             "--camera",
-            self.location,
+            self.name,
             self.source,
         ]
 
@@ -745,8 +830,9 @@ class UnifiedTrackerProcess:
         ]
         if resolve_torch_device(self.device).startswith("cuda"):
             cmd.append("--gpu-unified")
-        for _name, source, location in self.configs:
-            cmd.extend(["--camera", location, source])
+        for name, source, _location in self.configs:
+            # Stable id key — same as go2rtc cam{N} and /live_preview/cameras/{id}.jpg
+            cmd.extend(["--camera", str(name), source])
         return cmd
 
     def _close_stdout(self) -> None:
@@ -858,6 +944,106 @@ class UnifiedTrackerProcess:
         return True
 
 
+def _list_dashboard_pids() -> List[int]:
+    """Return PIDs for dashboard.py child processes (Windows-friendly)."""
+    pids: List[int] = []
+    dashboard_py = str(PROJECT_DIR / "dashboard.py").replace("\\", "/")
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                [
+                    "wmic",
+                    "process",
+                    "where",
+                    f"CommandLine like '%{dashboard_py}%'",
+                    "get",
+                    "ProcessId",
+                    "/format:csv",
+                ],
+                text=True,
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            for line in out.splitlines():
+                cell = line.strip()
+                if cell.isdigit():
+                    pids.append(int(cell))
+        else:
+            out = subprocess.check_output(["pgrep", "-f", "dashboard.py"], text=True)
+            for line in out.splitlines():
+                if line.strip().isdigit():
+                    pids.append(int(line.strip()))
+    except Exception as exc:
+        log.warning("Could not scan for dashboard processes: %s", exc)
+    return sorted(set(pids))
+
+
+def _port_listener_pids(port: int = 5000) -> List[int]:
+    """PIDs currently LISTENING on ``port`` (Windows netstat; empty on failure)."""
+    found: List[int] = []
+    if sys.platform != "win32":
+        return found
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano"],
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return found
+    needle = f":{port} "
+    for line in out.splitlines():
+        if "LISTENING" not in line.upper() or needle not in line:
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        try:
+            found.append(int(parts[-1]))
+        except ValueError:
+            continue
+    return sorted(set(found))
+
+
+def _terminate_stale_dashboard_processes() -> None:
+    """Kill orphan dashboard.py instances (duplicate port 5000 → random API errors)."""
+    pids = sorted(set(_list_dashboard_pids() + _port_listener_pids(5000)))
+    # Never kill ourselves if somehow listed.
+    pids = [p for p in pids if p != os.getpid()]
+    if not pids:
+        return
+    log.warning(
+        "Stopping %d existing dashboard/port-5000 process(es) before fresh start: %s",
+        len(pids),
+        pids,
+    )
+    for pid in pids:
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            else:
+                subprocess.run(["kill", "-TERM", str(pid)], check=False)
+        except Exception as exc:
+            log.warning("Failed to stop dashboard pid %s: %s", pid, exc)
+    # Wait until :5000 is free — overlapping listeners cause Errno 22 / flaky scans.
+    deadline = time.time() + 8.0
+    while time.time() < deadline:
+        left = _port_listener_pids(5000)
+        if not left:
+            break
+        time.sleep(0.4)
+    else:
+        log.warning(
+            "Port 5000 still held by PID(s) %s — Target Trace scans may fail "
+            "with [Errno 22] Invalid argument until only one dashboard owns the port.",
+            _port_listener_pids(5000),
+        )
+
+
 def _start_dashboard() -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -887,7 +1073,9 @@ def _start_dashboard() -> subprocess.Popen:
 
 
 def _start_go2rtc() -> Optional[subprocess.Popen]:
-    """Launch go2rtc WebRTC on :1984 so Fast Live can use H.264 (not JPEG)."""
+    """Launch go2rtc WebRTC on :1986 so Fast Live can use H.264 (not JPEG).
+    MSA_CCTV_100 binds :1984 and MSA_CCTV binds :1985 — keep this project on GO2RTC_PORT (default 1986).
+    """
     nvr_dir = PROJECT_DIR / "nvr"
     exe = nvr_dir / "go2rtc.exe"
     if not exe.is_file():
@@ -918,19 +1106,90 @@ def _start_go2rtc() -> Optional[subprocess.Popen]:
         stdout=out,
         stderr=subprocess.STDOUT,
     )
-    port = (os.environ.get("GO2RTC_PORT") or "1985").strip() or "1985"
+    port = (os.environ.get("GO2RTC_PORT") or "1986").strip() or "1986"
     log.info("go2rtc WebRTC:     http://127.0.0.1:%s  (pid %s)", port, proc.pid)
     return proc
 
 
+def _plates_enabled(args: argparse.Namespace) -> bool:
+    if getattr(args, "no_plates", False):
+        return False
+    if getattr(args, "plates", False):
+        return True
+    raw = os.environ.get("ENABLE_LICENSE_PLATE", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _start_plate_capture() -> Optional[subprocess.Popen]:
+    """Background YOLO+EasyOCR plate reader (separate process from face tracker)."""
+    script = PROJECT_DIR / "plate_capture.py"
+    if not script.is_file():
+        log.warning("plate_capture.py missing — license plate detection disabled")
+        return None
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    cams = (os.environ.get("LICENSE_PLATE_CAMERAS") or "all").strip()
+    every = (os.environ.get("LICENSE_PLATE_OCR_EVERY") or "").strip()
+    cmd = [sys.executable, str(script)]
+    scope_label = cams
+    if cams.lower() in ("all", "*", "every", ""):
+        cmd.append("--all")
+        scope_label = "ALL cameras"
+        if not every:
+            every = "15"
+    else:
+        cmd.extend(["--cam", cams])
+        if not every:
+            every = "12"
+    cmd.extend(["--every", every, "--no-display"])
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_DIR),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+    thread = threading.Thread(
+        target=_stream_output,
+        args=(proc.stdout, "[PLATE]"),
+        name="log-plate-capture",
+        daemon=True,
+    )
+    thread.start()
+    log.info(
+        "License plates:    %s (OCR every %s frames, pid %s)",
+        scope_label,
+        every,
+        proc.pid,
+    )
+    return proc
+
+
 def _terminate_all() -> None:
-    global _SHUTTING_DOWN, _dashboard, _go2rtc, _cleanup_stop, _unified_tracker, _cameras
+    global _SHUTTING_DOWN, _dashboard, _go2rtc, _plate_capture, _cleanup_stop, _unified_tracker, _cameras
     if _SHUTTING_DOWN:
         return
     _SHUTTING_DOWN = True
 
     if _cleanup_stop is not None:
         _cleanup_stop.set()
+
+    plate = _plate_capture
+    _plate_capture = None
+    if plate is not None and plate.poll() is None:
+        try:
+            plate.terminate()
+        except Exception:
+            pass
+        try:
+            plate.wait(timeout=4)
+        except Exception:
+            try:
+                plate.kill()
+            except Exception:
+                pass
 
     go2rtc = _go2rtc
     _go2rtc = None
@@ -1040,7 +1299,10 @@ def _write_status() -> None:
                         "location": location,
                         "alive": alive,
                         "restart_count": _unified_tracker.restart_count,
-                        "faces_detected": read_faces_detected(location),
+                        "faces_detected": max(
+                            read_faces_detected(name),
+                            read_faces_detected(location),
+                        ),
                     }
                     for name, _source, location in _unified_tracker.configs
                 ]
@@ -1183,7 +1445,7 @@ def _config_watcher(interval: float = 2.0) -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    global _cameras, _dashboard, _go2rtc, _INFERENCE_DEVICE, _FRAME_SKIP, _INFERENCE_SIZE
+    global _cameras, _dashboard, _go2rtc, _plate_capture, _INFERENCE_DEVICE, _FRAME_SKIP, _INFERENCE_SIZE
     global _cleanup_stop, _unified_tracker, _use_unified_tracker
 
     args = _parse_args()
@@ -1343,10 +1605,7 @@ def main() -> int:
         log.info("  - %s: %s (%s)", name, location, _mask_source_for_log(source))
 
     if not args.skip_validation:
-        validation_results = [
-            (name, _validate_camera_source(source))
-            for name, source, _location in configs
-        ]
+        validation_results = _validate_cameras_parallel(configs)
         reachable_count = sum(1 for _name, (ok, _reason) in validation_results if ok)
         for name, (ok, reason) in validation_results:
             if ok:
@@ -1368,9 +1627,12 @@ def main() -> int:
                     "    RTSP_USER=admin\n"
                     "    RTSP_PASSWORD=your_camera_password"
                 )
-            else:
-                log.error("All cameras unreachable at startup — aborting before launch.")
-            return 1
+                return 1
+            # Network may come up later (new VLAN/route). Start and keep retrying.
+            log.warning(
+                "All cameras unreachable at startup — launching anyway; "
+                "trackers will retry until RTSP is reachable."
+            )
     else:
         log.warning("Startup camera validation skipped (--skip-validation).")
 
@@ -1386,8 +1648,14 @@ def main() -> int:
     )
 
     try:
+        _terminate_stale_dashboard_processes()
         _dashboard = _start_dashboard()
         _go2rtc = _start_go2rtc()
+        if _plates_enabled(args):
+            _plate_capture = _start_plate_capture()
+        else:
+            log.info("License plates:    disabled (--no-plates or ENABLE_LICENSE_PLATE=0)")
+            _plate_capture = None
         with _cameras_lock:
             if _use_unified_tracker:
                 _unified_tracker = UnifiedTrackerProcess(
@@ -1445,6 +1713,15 @@ def main() -> int:
                 )
                 _terminate_all()
                 return dash_code if dash_code != 0 else 0
+
+            if _plate_capture is not None and _plate_capture.poll() is not None:
+                code = _plate_capture.poll()
+                log.warning("License plate worker stopped (exit code %s) — restarting…", code)
+                try:
+                    _plate_capture = _start_plate_capture()
+                except Exception as exc:
+                    log.warning("Plate worker restart failed: %s", exc)
+                    _plate_capture = None
 
             with _cameras_lock:
                 unified = _unified_tracker
