@@ -2,9 +2,9 @@
 
 Cyber Eye keeps username and password login. A Keycloak user with the `cyber-eye` / `access` role can also enter through `/auth/sso/login` and land on `/dashboard`.
 
-The dashboard origin is `https://192.168.11.65:5000`. The browser callback is `https://192.168.11.65:5000/auth/sso/callback`.
+The dashboard origin is `http://192.168.11.65:5000`. The browser callback is `http://192.168.11.65:5000/auth/sso/callback`.
 
-`KEYCLOAK_ISSUER_URL` must be the same realm address the user already used to sign in to CyberHub. The Cyber Eye process has to be able to open that address. Set `CYBER_EYE_ALLOW_INSECURE_HTTP=true` only when that issuer is HTTP. Restart the dashboard after changing `.env`.
+`KEYCLOAK_ISSUER_URL` must be the same realm address the user already used to sign in to CyberHub. The Cyber Eye process has to be able to open that address. Set `CYBER_EYE_ALLOW_INSECURE_HTTP=true` because the dashboard origin is HTTP. Also set it when the Keycloak issuer is HTTP. Restart the dashboard after changing `.env`.
 
 ## Routes
 
@@ -18,12 +18,12 @@ POST /auth/sso/backchannel-logout
 ## Environment
 
 ```text
-CYBER_EYE_PUBLIC_URL=https://192.168.11.65:5000
+CYBER_EYE_PUBLIC_URL=http://192.168.11.65:5000
 CYBER_EYE_SSO_ENABLED=true
 KEYCLOAK_ISSUER_URL
 KEYCLOAK_CLIENT_ID=cyber-eye
 KEYCLOAK_CLIENT_SECRET
-CYBER_EYE_ALLOW_INSECURE_HTTP=false
+CYBER_EYE_ALLOW_INSECURE_HTTP=true
 ```
 
 `CYBER_EYE_SSO_ENABLED=false` leaves password login in place and answers the SSO routes with `sso_disabled`.

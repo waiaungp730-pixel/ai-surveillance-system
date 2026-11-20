@@ -36,7 +36,7 @@ def _flag(name: str) -> bool:
 
 
 def sso_settings() -> dict:
-    public = (os.environ.get("CYBER_EYE_PUBLIC_URL") or "https://192.168.11.65:5000").rstrip("/")
+    public = (os.environ.get("CYBER_EYE_PUBLIC_URL") or "http://192.168.11.65:5000").rstrip("/")
     return {
         "enabled": _flag("CYBER_EYE_SSO_ENABLED"),
         "public_url": public,

@@ -16,11 +16,11 @@ class SsoRoutesTest(unittest.TestCase):
             os.environ,
             {
                 "CYBER_EYE_SSO_ENABLED": "true",
-                "CYBER_EYE_PUBLIC_URL": "https://192.168.11.65:5000",
+                "CYBER_EYE_PUBLIC_URL": "http://192.168.11.65:5000",
                 "KEYCLOAK_ISSUER_URL": "https://id.example.test/realms/cyberhub",
                 "KEYCLOAK_CLIENT_ID": "cyber-eye",
                 "KEYCLOAK_CLIENT_SECRET": "test-secret",
-                "CYBER_EYE_ALLOW_INSECURE_HTTP": "false",
+                "CYBER_EYE_ALLOW_INSECURE_HTTP": "true",
                 "CYBER_EYE_SSO_STORE": self.store.name,
             },
             clear=False,
