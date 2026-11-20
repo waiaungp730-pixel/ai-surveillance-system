@@ -6,6 +6,7 @@ flask>=3.0
 flask-socketio>=5.3
 python-dotenv>=1.0
 requests>=2.31
+PyJWT>=2.8
 pillow>=10.0
 pillow-heif>=0.18
 scikit-image>=0.22

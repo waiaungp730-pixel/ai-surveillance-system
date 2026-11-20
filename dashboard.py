@@ -182,6 +182,10 @@ socketio = SocketIO(
     async_mode="threading",
 )
 
+from sso_auth import register_sso, sso_logout_target, sso_session_active
+
+register_sso(app)
+
 _AUTH_EXEMPT_ENDPOINTS = frozenset(
     {
         "login",
@@ -189,6 +193,10 @@ _AUTH_EXEMPT_ENDPOINTS = frozenset(
         "static",
         "internal_database_purged",
         "internal_person_alert",
+        "sso_login",
+        "sso_callback",
+        "sso_logout",
+        "sso_backchannel_logout",
     }
 )
 
@@ -235,6 +243,8 @@ _PUBLIC_ASSET_PREFIXES = (
 @app.before_request
 def enforce_dashboard_auth():
     """Session gate — block unauthorized access to pages, APIs, and assets."""
+    if session.get("sso_sid") and not sso_session_active(session.get("sso_sid")):
+        session.clear()
     path = request.path or ""
     # Allow bare /static/* for login chrome, but not /static/crops or uploads.
     if path.startswith("/static/"):
@@ -3416,8 +3426,9 @@ def login():
 
 @app.route("/logout", methods=["GET", "POST"])
 def logout():
+    target = sso_logout_target()
     session.clear()
-    return redirect(url_for("login"))
+    return redirect(target or url_for("login"))
 
 
 @app.route("/")

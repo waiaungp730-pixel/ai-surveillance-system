@@ -11,6 +11,7 @@ venv/
 .env.*
 !.env.example
 .local_secrets.json
+.sso_sessions.json
 announcement_settings.json
 cameras.json
 nvr/go2rtc.yaml
