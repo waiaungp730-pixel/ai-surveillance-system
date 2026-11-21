@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import secrets
@@ -25,10 +26,17 @@ ATTEMPT_COOKIE = "cybereye.attempt"
 ATTEMPT_TTL_S = 10 * 60
 SESSION_TTL_S = 8 * 60 * 60
 IDLE_TTL_S = 30 * 60
+TOKEN_LEEWAY_S = 300
 LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
 
 _store_lock = threading.Lock()
 _discovery_cache: dict[str, tuple[float, dict]] = {}
+
+
+class SsoTokenError(RuntimeError):
+    def __init__(self, code: str, detail: str = ""):
+        self.code = code
+        super().__init__(detail or code)
 
 
 def _flag(name: str) -> bool:
@@ -100,7 +108,7 @@ def begin_login(settings: dict) -> dict:
             "response_type": "code",
             "client_id": settings["client_id"],
             "redirect_uri": settings["public_url"] + "/auth/sso/callback",
-            "scope": "openid",
+            "scope": "openid profile email",
             "state": state,
             "nonce": nonce,
             "code_challenge": challenge,
@@ -120,44 +128,66 @@ def _verify_token(token: str, jwks_uri: str, issuer: str, audience: str) -> dict
     from jwt import PyJWKClient
 
     key = PyJWKClient(jwks_uri).get_signing_key_from_jwt(token)
-    claims = jwt.decode(
-        token,
-        key.key,
-        algorithms=["RS256"],
-        issuer=issuer,
-        options={"verify_aud": False},
-    )
+    try:
+        claims = jwt.decode(
+            token,
+            key.key,
+            algorithms=["RS256"],
+            options={"verify_aud": False, "verify_iss": False},
+            leeway=TOKEN_LEEWAY_S,
+        )
+    except Exception as error:
+        raise SsoTokenError("id_token_invalid", str(error) or type(error).__name__) from error
     if not isinstance(claims, dict):
-        raise ValueError("claims")
+        raise SsoTokenError("claims")
+    token_issuer = str(claims.get("iss") or "").rstrip("/")
+    if token_issuer != issuer.rstrip("/"):
+        raise SsoTokenError(
+            "issuer_mismatch",
+            f"token={token_issuer} expected={issuer.rstrip('/')}",
+        )
     audiences = claims.get("aud")
     if not isinstance(audiences, list):
         audiences = [audiences]
     if audience not in audiences and claims.get("azp") != audience:
-        raise ValueError("audience")
+        raise SsoTokenError("audience", f"aud={audiences} azp={claims.get('azp')}")
     return claims
 
 
 def complete_login(settings: dict, code: str, verifier: str, nonce: str) -> dict:
     metadata = _discovery(settings["issuer"])
-    response = requests.post(
-        metadata["token_endpoint"],
-        data={
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": settings["public_url"] + "/auth/sso/callback",
-            "client_id": settings["client_id"],
-            "client_secret": settings["client_secret"],
-            "code_verifier": verifier,
-        },
-        timeout=10,
-    )
-    response.raise_for_status()
+    token_endpoint = metadata.get("token_endpoint")
+    if not isinstance(token_endpoint, str) or not token_endpoint:
+        raise SsoTokenError("token_endpoint_missing")
+    try:
+        response = requests.post(
+            token_endpoint,
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": settings["public_url"] + "/auth/sso/callback",
+                "client_id": settings["client_id"],
+                "client_secret": settings["client_secret"],
+                "code_verifier": verifier,
+            },
+            timeout=10,
+        )
+    except requests.RequestException as error:
+        raise SsoTokenError("token_request_failed", type(error).__name__) from error
+    if response.status_code >= 400:
+        body = ""
+        try:
+            body = str(response.json().get("error") or "")
+        except Exception:
+            body = ""
+        raise SsoTokenError(f"token_http_{response.status_code}", body or response.reason)
     token = response.json().get("id_token")
     if not isinstance(token, str):
-        raise ValueError("missing id token")
-    claims = _verify_token(token, metadata["jwks_uri"], settings["issuer"], settings["client_id"])
+        raise SsoTokenError("missing_id_token")
+    expected_issuer = str(metadata.get("issuer") or settings["issuer"]).rstrip("/")
+    claims = _verify_token(token, metadata["jwks_uri"], expected_issuer, settings["client_id"])
     if claims.get("nonce") != nonce:
-        raise ValueError("nonce")
+        raise SsoTokenError("nonce_mismatch")
     username = claims.get("preferred_username") or claims.get("name") or "cyberhub"
     return {
         "issuer": claims["iss"],
@@ -190,7 +220,8 @@ def end_session_url(settings: dict) -> str:
 
 def verify_logout(settings: dict, token: str) -> dict:
     metadata = _discovery(settings["issuer"])
-    claims = _verify_token(token, metadata["jwks_uri"], settings["issuer"], settings["client_id"])
+    expected_issuer = str(metadata.get("issuer") or settings["issuer"]).rstrip("/")
+    claims = _verify_token(token, metadata["jwks_uri"], expected_issuer, settings["client_id"])
     events = claims.get("events") or {}
     if claims.get("nonce") is not None or LOGOUT_EVENT not in events:
         raise ValueError("logout token")
@@ -206,7 +237,7 @@ def verify_logout(settings: dict, token: str) -> dict:
 
 
 def _empty_store() -> dict:
-    return {"sessions": {}, "logout_jti": {}}
+    return {"sessions": {}, "logout_jti": {}, "attempts": {}}
 
 
 def _load_store(path: Path) -> dict:
@@ -218,6 +249,7 @@ def _load_store(path: Path) -> dict:
         return _empty_store()
     data.setdefault("sessions", {})
     data.setdefault("logout_jti", {})
+    data.setdefault("attempts", {})
     return data
 
 
@@ -240,6 +272,42 @@ def _prune(data: dict, now: float) -> None:
     for jti, exp in list(data["logout_jti"].items()):
         if exp <= now:
             data["logout_jti"].pop(jti, None)
+    for state, row in list(data.get("attempts", {}).items()):
+        if row.get("exp", 0) <= now:
+            data["attempts"].pop(state, None)
+
+
+def save_attempt(settings: dict, record: dict, ttl: int = ATTEMPT_TTL_S) -> None:
+    """Remember the PKCE attempt by Keycloak state so a lost browser cookie still works."""
+    now = time.time()
+    with _store_lock:
+        data = _load_store(settings["store_path"])
+        _prune(data, now)
+        data.setdefault("attempts", {})
+        data["attempts"][record["state"]] = {
+            "state": record["state"],
+            "nonce": record["nonce"],
+            "verifier": record["verifier"],
+            "exp": now + ttl,
+        }
+        _save_store(settings["store_path"], data)
+
+
+def take_attempt_by_state(settings: dict, state: str) -> dict | None:
+    if not state:
+        return None
+    now = time.time()
+    with _store_lock:
+        data = _load_store(settings["store_path"])
+        _prune(data, now)
+        row = data.get("attempts", {}).pop(state, None)
+        if row is not None:
+            _save_store(settings["store_path"], data)
+        if not row or row.get("exp", 0) <= now:
+            return None
+        if not row.get("verifier") or not row.get("nonce"):
+            return None
+        return {"state": state, "nonce": row["nonce"], "verifier": row["verifier"]}
 
 
 def remember_session(settings: dict, local_sid: str, provider_sid: str | None, subject: str) -> None:
@@ -312,16 +380,19 @@ def sso_logout_target() -> str | None:
         return None
 
 
-def _deny(status: int, detail: str):
+def _deny(status: int, detail: str, hint: str = ""):
     messages = {
         "workspace_access_required": "This CyberHub account is not allowed to open Cyber Eye.",
         "invalid_auth_attempt": "The sign-in attempt is invalid or has expired.",
+        "token_exchange_failed": "CyberHub accepted the sign-in, but Cyber Eye could not finish it. Start again from the portal card.",
     }
     text = messages.get(detail, "Sign-in was rejected.")
+    if hint and detail == "token_exchange_failed":
+        text = f"{text} ({hint})"
     return f"<!DOCTYPE html><html><body><p>{text}</p></body></html>", status
 
 
-def _read_attempt(secret: str, state: str) -> dict | None:
+def _read_cookie_attempt(secret: str, state: str) -> dict | None:
     raw = request.cookies.get(ATTEMPT_COOKIE)
     if not raw or not state:
         return None
@@ -334,6 +405,16 @@ def _read_attempt(secret: str, state: str) -> dict | None:
     if not payload.get("verifier") or not payload.get("nonce"):
         return None
     return payload
+
+
+def resolve_attempt(secret: str, state: str, settings: dict) -> dict | None:
+    """Prefer the signed cookie; fall back to the server attempt store by state."""
+    sealed = _read_cookie_attempt(secret, state)
+    if sealed is not None:
+        # Drop the server copy so the state cannot be replayed.
+        take_attempt_by_state(settings, state)
+        return sealed
+    return take_attempt_by_state(settings, state)
 
 
 def register_sso(app: Flask) -> None:
@@ -361,10 +442,25 @@ def register_sso(app: Flask) -> None:
             return jsonify({"detail": "sso_misconfigured"}), 503
         if session.get("logged_in") is True and sso_session_active(session.get("sso_sid"), settings):
             return redirect("/dashboard")
-        started = begin_login(settings)
-        token = _serializer(app.secret_key).dumps(
-            {"state": started["state"], "nonce": started["nonce"], "verifier": started["verifier"]}
-        )
+        try:
+            started = begin_login(settings)
+        except Exception as error:
+            issuer = settings.get("issuer") or ""
+            print(f"Cyber Eye SSO discovery failed: {type(error).__name__} issuer={issuer}")
+            safe_issuer = html.escape(issuer or "the configured identity provider")
+            body = (
+                "<!DOCTYPE html><html><body>"
+                f"<p>Cyber Eye could not reach the CyberHub sign-in service at {safe_issuer}.</p>"
+                "</body></html>"
+            )
+            return body, 503
+        record = {
+            "state": started["state"],
+            "nonce": started["nonce"],
+            "verifier": started["verifier"],
+        }
+        save_attempt(settings, record)
+        token = _serializer(app.secret_key).dumps(record)
         response = redirect(started["url"], code=303)
         return _cookie(response, settings, token)
 
@@ -373,16 +469,18 @@ def register_sso(app: Flask) -> None:
         settings = sso_settings()
         if not settings["enabled"]:
             return jsonify({"detail": "sso_disabled"}), 404
-        attempt = _read_attempt(app.secret_key, request.args.get("state") or "")
+        state = request.args.get("state") or ""
         code = request.args.get("code") or ""
+        attempt = resolve_attempt(app.secret_key, state, settings)
         if not attempt or not code:
             response = app.make_response(_deny(400, "invalid_auth_attempt"))
             return _cookie(response, settings, None)
         try:
             identity = complete_login(settings, code, attempt["verifier"], attempt["nonce"])
         except Exception as error:
-            print(f"Cyber Eye SSO token exchange failed: {type(error).__name__}")
-            response = app.make_response(_deny(400, "invalid_auth_attempt"))
+            code_name = getattr(error, "code", None) or type(error).__name__
+            print(f"Cyber Eye SSO token exchange failed: {code_name}: {error}")
+            response = app.make_response(_deny(400, "token_exchange_failed", str(code_name)))
             return _cookie(response, settings, None)
         if not has_workspace_access(identity["resource_access"], settings["client_id"]):
             response = app.make_response(_deny(403, "workspace_access_required"))

@@ -49,6 +49,12 @@ class SsoRoutesTest(unittest.TestCase):
             response = self.client.get("/auth/sso/login")
         self.assertEqual(response.status_code, 503)
 
+    def test_login_reports_an_unreachable_identity_provider(self):
+        with patch.object(sso_auth, "begin_login", side_effect=ConnectionError("refused")):
+            response = self.client.get("/auth/sso/login")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(b"could not reach", response.data)
+
     def test_login_redirects_to_keycloak_with_pkce(self):
         with patch.object(
             sso_auth,
@@ -96,6 +102,37 @@ class SsoRoutesTest(unittest.TestCase):
             self.assertEqual(current["username"], "ada")
             self.assertTrue(sso_auth.sso_session_active(current["sso_sid"]))
 
+    def test_callback_matches_state_when_the_browser_drops_the_cookie(self):
+        with patch.object(
+            sso_auth,
+            "begin_login",
+            return_value={
+                "url": "https://id.example.test/auth",
+                "state": "state-from-keycloak",
+                "nonce": "nonce-1",
+                "verifier": "verifier-1",
+            },
+        ):
+            self.client.get("/auth/sso/login")
+        self.client.delete_cookie("cybereye.attempt")
+        with patch.object(
+            sso_auth,
+            "complete_login",
+            return_value={
+                "issuer": "https://id.example.test/realms/cyberhub",
+                "subject": "user-2",
+                "username": "lin",
+                "provider_sid": "provider-2",
+                "resource_access": {"cyber-eye": {"roles": ["access"]}},
+            },
+        ):
+            response = self.client.get("/auth/sso/callback?code=abc&state=state-from-keycloak")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["Location"], "/dashboard")
+        replay = self.client.get("/auth/sso/callback?code=abc&state=state-from-keycloak")
+        self.assertEqual(replay.status_code, 400)
+        self.assertIn(b"invalid or has expired", replay.data)
+
     def test_callback_rejects_an_account_without_the_access_role(self):
         with patch.object(
             sso_auth,
@@ -122,6 +159,28 @@ class SsoRoutesTest(unittest.TestCase):
             response = self.client.get("/auth/sso/callback?code=abc&state=state-1")
         self.assertEqual(response.status_code, 403)
         self.assertIn(b"not allowed", response.data)
+
+    def test_token_exchange_failure_is_not_shown_as_an_expired_attempt(self):
+        with patch.object(
+            sso_auth,
+            "begin_login",
+            return_value={
+                "url": "https://id.example.test/auth",
+                "state": "state-token",
+                "nonce": "nonce-1",
+                "verifier": "verifier-1",
+            },
+        ):
+            self.client.get("/auth/sso/login")
+        with patch.object(
+            sso_auth,
+            "complete_login",
+            side_effect=sso_auth.SsoTokenError("id_token_invalid", "clock"),
+        ):
+            response = self.client.get("/auth/sso/callback?code=abc&state=state-token")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"could not finish", response.data)
+        self.assertIn(b"id_token_invalid", response.data)
 
     def test_backchannel_logout_removes_the_session(self):
         sso_auth.remember_session(sso_auth.sso_settings(), "local-1", "provider-1", "user-1")
